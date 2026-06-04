@@ -1,0 +1,13 @@
+{
+    "proxy_enabled": false,
+    "proxy_type": "HTTP",
+    "proxy_host": "127.0.0.1",
+    "proxy_port": 8080,
+    "proxy_user": "",
+    "proxy_pass": "",
+    "adblock_enabled": true,
+    "https_only": true,
+    "search_engine": "https://searx.be/search?q=",
+    "search_engine_name": "SearXNG",
+    "homepage": "https://duckduckgo.com"
+}
