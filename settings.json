@@ -1,13 +1,13 @@
 {
     "proxy_enabled": false,
-    "proxy_type": "HTTP",
-    "proxy_host": "127.0.0.1",
-    "proxy_port": 8080,
-    "proxy_user": "",
-    "proxy_pass": "",
+    "proxy_type": "SOCKS5",
+    "proxy_host": "geo.iproyal.vip",
+    "proxy_port": 8888,
+    "proxy_user": "user-10020125_42-country-BR-session-620054",
+    "proxy_pass": "RNXOjU3y6Vg7m",
     "adblock_enabled": true,
     "https_only": true,
-    "search_engine": "https://searx.be/search?q=",
-    "search_engine_name": "SearXNG",
+    "search_engine": "https://duckduckgo.com/?q=",
+    "search_engine_name": "DuckDuckGo",
     "homepage": "https://duckduckgo.com"
 }

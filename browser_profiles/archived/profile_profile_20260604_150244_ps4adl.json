@@ -1,0 +1,14 @@
+{
+    "id": "profile_20260604_150254_ssnfw0",
+    "created": "2026-06-04T15:02:54.902739",
+    "last_reset": "2026-06-04T15:02:54.902748",
+    "browser_fingerprint": {
+        "canvas": "68a43d64339d952e5abbbf0facdcc8da2deebaa56a5a1baeb324713c5aaf6f2c",
+        "webgl": "1186d52cdd1e1aac92ef4edc19ff2b30a0b964feebb612db5f40c780e2ffbc62",
+        "audio": "6bbc02f22e24eab13a29e26dd892f69fec5da93b0df0aff3e80eac049178dbc2",
+        "font_hash": "45a108cb8cecb9bda41fb063342efc9a",
+        "locale": "en-AU",
+        "timezone": "EST"
+    },
+    "cookies_injected": false
+}

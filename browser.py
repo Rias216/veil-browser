@@ -1,5 +1,9 @@
 import sys
 import os
+import json
+import random
+import string
+from datetime import datetime
 from PySide6.QtCore import QUrl, QTimer, Qt
 from PySide6.QtGui import QAction, QActionGroup
 from PySide6.QtWidgets import (
@@ -28,6 +32,98 @@ SPOOFED_UA = (
 )
 
 
+class IdentityManager:
+    """Manages browser identity, cookies, and fingerprints"""
+    
+    PROFILE_DIR = "browser_profiles"
+    
+    def __init__(self):
+        os.makedirs(self.PROFILE_DIR, exist_ok=True)
+        self.current_profile_id = self.load_or_create_profile()
+    
+    def load_or_create_profile(self):
+        """Load existing profile or create new one"""
+        profile_file = os.path.join(self.PROFILE_DIR, "current_profile.json")
+        
+        if os.path.exists(profile_file):
+            try:
+                with open(profile_file, 'r') as f:
+                    profile = json.load(f)
+                    return profile.get('id')
+            except:
+                pass
+        
+        # Create new profile
+        return self.generate_new_profile()
+    
+    def generate_new_profile(self):
+        """Generate a completely new browser identity"""
+        profile_id = self._generate_id()
+        profile_data = {
+            'id': profile_id,
+            'created': datetime.now().isoformat(),
+            'last_reset': datetime.now().isoformat(),
+            'browser_fingerprint': self._generate_fingerprint(),
+            'cookies_injected': False
+        }
+        
+        profile_file = os.path.join(self.PROFILE_DIR, "current_profile.json")
+        with open(profile_file, 'w') as f:
+            json.dump(profile_data, f, indent=4)
+        
+        print(f"✓ Generated new browser profile: {profile_id}")
+        return profile_id
+    
+    def reset_identity(self):
+        """Full identity reset"""
+        print("🔄 Resetting digital identity...")
+        
+        old_id = self.current_profile_id
+        new_id = self.generate_new_profile()
+        
+        self.current_profile_id = new_id
+        
+        # Archive old profile
+        archive_dir = os.path.join(self.PROFILE_DIR, "archived")
+        os.makedirs(archive_dir, exist_ok=True)
+        
+        profile_file = os.path.join(self.PROFILE_DIR, "current_profile.json")
+        archive_file = os.path.join(archive_dir, f"profile_{old_id}.json")
+        
+        try:
+            if os.path.exists(profile_file):
+                with open(profile_file, 'r') as src:
+                    archived_data = json.load(src)
+                with open(archive_file, 'w') as dst:
+                    json.dump(archived_data, dst, indent=4)
+        except:
+            pass
+        
+        return new_id
+    
+    @staticmethod
+    def _generate_id():
+        """Generate unique profile ID"""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        random_suffix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
+        return f"profile_{timestamp}_{random_suffix}"
+    
+    @staticmethod
+    def _generate_fingerprint():
+        """Generate a realistic browser fingerprint"""
+        return {
+            'canvas': ''.join(random.choices(string.hexdigits, k=64)).lower(),
+            'webgl': ''.join(random.choices(string.hexdigits, k=64)).lower(),
+            'audio': ''.join(random.choices(string.hexdigits, k=64)).lower(),
+            'font_hash': ''.join(random.choices(string.hexdigits, k=32)).lower(),
+            'locale': random.choice(['en-US', 'en-GB', 'en-CA', 'en-AU']),
+            'timezone': random.choice(['UTC', 'EST', 'CST', 'MST', 'PST']),
+        }
+    
+    def get_current_profile_id(self):
+        return self.current_profile_id
+
+
 class WebPage(QWebEnginePage):
     """Custom page that routes target='_blank' and JS window.open into new tabs."""
 
@@ -42,11 +138,12 @@ class WebPage(QWebEnginePage):
 
 
 class BrowserWindow(QMainWindow):
-    def __init__(self, settings, adblocker, private_profile):
+    def __init__(self, settings, adblocker, private_profile, identity_manager):
         super().__init__()
         self.settings = settings
         self.adblocker = adblocker
         self.private_profile = private_profile
+        self.identity_manager = identity_manager
 
         self.setWindowTitle("Shield Browser")
         self.resize(1024, 768)
@@ -273,6 +370,7 @@ class BrowserWindow(QMainWindow):
 
         self.menu.addSeparator()
         self.menu.addAction("Proxy Configuration...", self.open_proxy_settings)
+        self.menu.addAction("Reset Digital Identity", self.reset_digital_identity)
         self.menu.addAction("Clear Browsing Data...", self.clear_browsing_data)
         self.menu.addSeparator()
         self.menu.addAction("Exit", self.close)
@@ -308,7 +406,8 @@ class BrowserWindow(QMainWindow):
 
     def init_statusbar(self):
         self.setStatusBar(QStatusBar())
-        self.statusBar().showMessage("Ready")
+        profile_id = self.identity_manager.get_current_profile_id()
+        self.statusBar().showMessage(f"Ready | Profile: {profile_id[:20]}...")
 
     # ── Tab Management ────────────────────────────────────────────────
     def add_new_tab(self, url=None, title="New Tab", private=False):
@@ -534,6 +633,45 @@ class BrowserWindow(QMainWindow):
         dialog = ProxyDialog(self.settings, self)
         dialog.exec()
 
+    def reset_digital_identity(self):
+        """Reset complete digital identity"""
+        confirm = QMessageBox.question(
+            self, "Reset Digital Identity",
+            "This will:\n"
+            "• Clear all cookies, site data, and cache\n"
+            "• Reset browser fingerprint\n"
+            "• Generate fresh browsing profile\n"
+            "• Inject new fake tracking cookies\n\n"
+            "All tabs will be closed. Continue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        
+        if confirm == QMessageBox.StandardButton.Yes:
+            # Clear all profiles
+            QWebEngineProfile.defaultProfile().clearHttpCache()
+            QWebEngineProfile.defaultProfile().cookieStore().deleteAllCookies()
+            
+            self.private_profile.clearHttpCache()
+            self.private_profile.cookieStore().deleteAllCookies()
+            
+            # Reset identity in manager
+            new_id = self.identity_manager.reset_identity()
+            
+            # Re-inject fake cookies with fresh values
+            inject_fake_cookies(QWebEngineProfile.defaultProfile())
+            inject_fake_cookies(self.private_profile)
+            
+            # Close all tabs and start fresh
+            while self.tabs.count() > 0:
+                self.close_tab(0)
+            
+            self.add_new_tab(private=False)
+            
+            # Update status
+            self.statusBar().showMessage(
+                f"✓ Digital identity reset! New profile: {new_id[:20]}...", 5000
+            )
+
     def clear_browsing_data(self):
         confirm = QMessageBox.question(
             self, "Clear Browsing Data",
@@ -575,6 +713,9 @@ def main():
     # Initialize settings
     settings = SettingsManager()
 
+    # Initialize identity manager
+    identity_manager = IdentityManager()
+
     # Initialize proxy
     apply_proxy(settings)
 
@@ -598,7 +739,7 @@ def main():
     block_third_party_cookies(private_profile)
 
     # Setup window
-    window = BrowserWindow(settings, adblocker, private_profile)
+    window = BrowserWindow(settings, adblocker, private_profile, identity_manager)
 
     # Connect downloads for both profiles
     default_profile.downloadRequested.connect(window.on_download_requested)
