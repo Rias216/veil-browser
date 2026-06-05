@@ -12,16 +12,17 @@ SEARCH_ENGINES = {
 
 DEFAULT_SETTINGS = {
     "proxy_enabled": False,
-    "proxy_type": "HTTP",
-    "proxy_host": "127.0.0.1",
-    "proxy_port": 8080,
+    "proxy_type": "SOCKS5",
+    "proxy_host": "",
+    "proxy_port": 0,
     "proxy_user": "",
     "proxy_pass": "",
     "adblock_enabled": True,
     "https_only": True,
     "search_engine": "https://duckduckgo.com/?q=",
     "search_engine_name": "DuckDuckGo",
-    "homepage": "https://duckduckgo.com"
+    "homepage": "https://duckduckgo.com",
+    "theme": "void"
 }
 
 class SettingsManager:

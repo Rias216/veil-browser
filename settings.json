@@ -1,13 +1,15 @@
 {
-    "proxy_enabled": false,
+    "proxy_enabled": true,
     "proxy_type": "SOCKS5",
     "proxy_host": "geo.iproyal.vip",
     "proxy_port": 8888,
-    "proxy_user": "user-10020125_42-country-BR-session-620054",
+    "proxy_user": "user-10020125_42-country-BR-session-933253",
     "proxy_pass": "RNXOjU3y6Vg7m",
     "adblock_enabled": true,
     "https_only": true,
     "search_engine": "https://duckduckgo.com/?q=",
     "search_engine_name": "DuckDuckGo",
-    "homepage": "https://duckduckgo.com"
+    "homepage": "https://duckduckgo.com",
+    "theme": "void",
+    "update_adblock_on_start": true
 }
