@@ -41,6 +41,7 @@ if platform.system() == "Windows":
     from ctypes import wintypes
 
 from config import SettingsManager, SEARCH_ENGINES
+from debug_log import log as _dl_log
 from adblocker import (
     AdBlocker, PrivacyRequestInterceptor,
     inject_fake_cookies, block_third_party_cookies
@@ -1196,6 +1197,33 @@ class NavButton(QPushButton):
             door.lineTo(cx + 1.2, cy + s - 0.5)
             painter.drawPath(door)
 
+        elif d == 'extensions':
+            # Puzzle-piece glyph: square body with a knob on the
+            # top-right and a matching notch on the bottom-left.
+            # Bounding box is roughly ±s around (cx, cy).
+            piece = QPainterPath()
+            # Outer outline, going clockwise.
+            piece.moveTo(cx - s + 1.0, cy - s)
+            piece.lineTo(cx + s - 0.5, cy - s)         # top edge
+            piece.arcTo(cx + s - 0.5 - 1.6, cy - s - 1.6,
+                        3.2, 3.2, 90, -180)            # top-right knob (out)
+            piece.lineTo(cx + s + 0.5, cy - s + 1.6)
+            piece.lineTo(cx + s + 0.5, cy + s - 0.5)    # right edge
+            piece.lineTo(cx + s - 1.6, cy + s - 0.5)
+            piece.arcTo(cx + s - 1.6 - 3.2, cy + s - 0.5 - 3.2,
+                        3.2, 3.2, 0, 180)              # right-side knob (out)
+            piece.lineTo(cx + s - 4.8, cy + s + 0.5)
+            piece.lineTo(cx - s + 0.5, cy + s + 0.5)    # bottom edge
+            piece.lineTo(cx - s + 0.5, cy + s - 1.6)
+            piece.lineTo(cx - s, cy + s - 1.6)
+            piece.arcTo(cx - s - 3.2, cy + s - 1.6 - 3.2,
+                        3.2, 3.2, -90, -180)           # bottom-left notch (in)
+            piece.lineTo(cx - s - 1.5, cy + s - 4.8)
+            piece.lineTo(cx - s, cy - s + 0.5)         # left edge
+            piece.lineTo(cx - s + 1.0, cy - s)
+            piece.closeSubpath()
+            painter.drawPath(piece)
+
 
 # ── SuggestionDelegate ──────────────────────────────────────────────
 class SuggestionDelegate(QStyledItemDelegate):
@@ -1691,6 +1719,7 @@ class ChromeBar(QWidget):
     reloadRequested = Signal()
     homeRequested = Signal()
     addTabRequested = Signal()
+    extensionsRequested = Signal()
 
     # ── Layout constants ─────────────────────────────────────────────
     BTN_SIZE = 28             # unified toolbar button size
@@ -1769,6 +1798,8 @@ class ChromeBar(QWidget):
         toolbar_layout.addSpacing(self.NAV_SPACING)
         self._add_address_bar(toolbar_layout)
         toolbar_layout.addSpacing(self.NAV_SPACING)
+        self._add_extensions_button(toolbar_layout)
+        toolbar_layout.addSpacing(self.NAV_SPACING)
         self._add_home_button(toolbar_layout)
 
     def _add_nav_buttons(self, layout):
@@ -1792,6 +1823,19 @@ class ChromeBar(QWidget):
         self.address_bar.setPlaceholderText("Search or enter address")
         self.address_bar.returnPressed.connect(self._on_url_submit)
         layout.addWidget(self.address_bar, 1)
+
+    def _add_extensions_button(self, layout):
+        """The puzzle-piece button that opens the extensions popup.
+
+        Uses a dedicated :class:`ExtensionsPopupButton` (not the
+        generic :class:`NavButton`) because the topbar extensions
+        affordance shows a count badge — Chrome's chrome://extensions
+        popup convention.
+        """
+        from extensions_popup import ExtensionsPopupButton
+        self.extensions_btn = ExtensionsPopupButton()
+        self.extensions_btn.clicked.connect(self.extensionsRequested)
+        layout.addWidget(self.extensions_btn)
 
     def _add_home_button(self, layout):
         self.home_btn = NavButton('home')
@@ -2202,7 +2246,34 @@ class BrowserWindow(QMainWindow):
         self.chrome.forwardRequested.connect(self.current_tab_forward)
         self.chrome.reloadRequested.connect(self.current_tab_reload)
         self.chrome.homeRequested.connect(self.go_home)
+        self.chrome.extensionsRequested.connect(self.toggle_extensions_popup)
         self.main_layout.addWidget(self.chrome)
+
+        # Extensions popup lives once per window; reused on every click.
+        from extensions_popup import ExtensionsPopup, ExtensionPopupItem
+        self._extensions_popup = ExtensionsPopup(self)
+        self._extensions_popup.manageRequested.connect(
+            self._on_popup_manage
+        )
+        self._extensions_popup.removeRequested.connect(
+            self._on_popup_remove_extension
+        )
+        self._extensions_popup.toggleRequested.connect(
+            self._on_popup_toggle_extension
+        )
+        self._extensions_popup.optionsRequested.connect(
+            self._on_popup_options
+        )
+        self._extensions_popup.closeRequested.connect(
+            self._on_popup_close
+        )
+        # Re-apply theme whenever the chrome theme changes.
+        self._refresh_extensions_popup_theme()
+        # Keep the puzzle-button badge in sync with the live extension
+        # count and auto-refresh the popup when it is open and the
+        # count changes (e.g. after an install/uninstall).
+        self.extension_loader.count_changed.connect(self._on_ext_count_changed)
+        self._on_ext_count_changed(self.extension_loader.count())
 
     def init_progress_bar(self):
         self.progress_bar = QProgressBar()
@@ -2436,6 +2507,7 @@ class BrowserWindow(QMainWindow):
         self.apply_theme()
         for action in self.theme_action_group.actions():
             action.setChecked(action.text() == self.theme.label)
+        self._refresh_extensions_popup_theme()
         self.statusBar().showMessage(f"Theme: {self.theme.label}", 2000)
 
     # ── Native window events (Windows: resize, snap, shadow) ──────────
@@ -2734,6 +2806,13 @@ class BrowserWindow(QMainWindow):
             if event.key() == Qt.Key.Key_F5:
                 self.current_tab_reload()
                 return True
+            # Ctrl+Shift+A → open the extensions popup (Chrome convention).
+            if (event.key() == Qt.Key.Key_A
+                    and event.modifiers() == (
+                        Qt.KeyboardModifier.ControlModifier
+                        | Qt.KeyboardModifier.ShiftModifier)):
+                self.toggle_extensions_popup()
+                return True
         return super().eventFilter(obj, event)
 
     # ── Extensions ───────────────────────────────────────────────────
@@ -2741,24 +2820,17 @@ class BrowserWindow(QMainWindow):
         t = self.theme
         c = t.colors
 
+        # Snapshot of (ExtensionInfo, display_label) for the list, so
+        # we can look up the right object when the user clicks Remove.
         installed = []
-        manager = None
         try:
-            manager = self.default_profile.extensionManager()
+            installed = self.extension_loader.live_extensions()
         except Exception as e:
-            print(f"[extensions] extensionManager() unavailable: {e}")
-
-        if manager is not None:
-            try:
-                raw = manager.extensions()
-                if raw is not None:
-                    installed = list(raw)
-            except Exception as e:
-                print(f"[extensions] Could not list extensions: {e}")
+            print(f"[extensions] Could not list extensions: {e}")
 
         dlg = QDialog(self)
         dlg.setWindowTitle("Extensions")
-        dlg.resize(440, 340)
+        dlg.resize(540, 380)
         dlg.setStyleSheet(f"""
             QDialog {{
                 background-color: {c.bg};
@@ -2792,6 +2864,19 @@ class BrowserWindow(QMainWindow):
                 background-color: {c.surface_hover};
                 border-color: {c.border_hover};
             }}
+            QPushButton#RemoveBtn {{
+                background-color: transparent;
+                color: {c.danger};
+                border: 1px solid {c.danger};
+            }}
+            QPushButton#RemoveBtn:hover {{
+                background-color: {c.danger};
+                color: white;
+            }}
+            QPushButton#RemoveBtn:disabled {{
+                color: {c.text_muted};
+                border-color: {c.border};
+            }}
             QLabel {{
                 color: {c.text_secondary};
             }}
@@ -2809,33 +2894,163 @@ class BrowserWindow(QMainWindow):
         layout.addWidget(header)
 
         list_widget = QListWidget()
+        ext_info_for_row: list = []  # parallel to list_widget rows
         for ext in installed:
             try:
-                item = QListWidgetItem(f"{ext.name()}  \u2014  {ext.id()}")
+                ext_id = ext.id()
             except Exception:
-                try:
-                    item = QListWidgetItem(str(ext.id()))
-                except Exception:
-                    item = QListWidgetItem(str(ext))
-            list_widget.addItem(item)
+                continue
+            if not ext_id:
+                continue
+            try:
+                name = ext.name() or ext_id
+            except Exception:
+                name = ext_id
+            try:
+                is_enabled = bool(ext.isEnabled())
+            except Exception:
+                is_enabled = True
+            status = "on" if is_enabled else "off"
+            label = f"{name}  \u2014  {ext_id}  [{status}]"
+            row = QListWidgetItem(label)
+            row.setData(Qt.ItemDataRole.UserRole, ext_id)
+            list_widget.addItem(row)
+            ext_info_for_row.append(ext)
         if not installed:
             placeholder = QListWidgetItem("(no extensions loaded)")
             placeholder.setFlags(Qt.ItemFlag.NoItemFlags)
             list_widget.addItem(placeholder)
         layout.addWidget(list_widget)
 
+        # Track which extension is selected so Remove / Toggle act on it.
+        selected_ext_id: list = [""]  # mutable container for closure
+
+        def _selected_index() -> int:
+            return list_widget.currentRow()
+
+        def _refresh_list():
+            # Reload the list from the live manager so any in-place
+            # changes (uninstall, enable/disable) are reflected.
+            list_widget.clear()
+            ext_info_for_row.clear()
+            try:
+                live = self.extension_loader.live_extensions()
+            except Exception:
+                live = []
+            for ext in live:
+                try:
+                    eid = ext.id()
+                except Exception:
+                    continue
+                if not eid:
+                    continue
+                try:
+                    name = ext.name() or eid
+                except Exception:
+                    name = eid
+                try:
+                    on = bool(ext.isEnabled())
+                except Exception:
+                    on = True
+                row = QListWidgetItem(f"{name}  \u2014  {eid}  [{'on' if on else 'off'}]")
+                row.setData(Qt.ItemDataRole.UserRole, eid)
+                list_widget.addItem(row)
+                ext_info_for_row.append(ext)
+            if list_widget.count() == 0:
+                placeholder = QListWidgetItem("(no extensions loaded)")
+                placeholder.setFlags(Qt.ItemFlag.NoItemFlags)
+                list_widget.addItem(placeholder)
+            _update_buttons()
+
+        def _update_buttons():
+            row = _selected_index()
+            has_sel = 0 <= row < len(ext_info_for_row)
+            remove_btn.setEnabled(has_sel)
+            toggle_btn.setEnabled(has_sel)
+
+        def _on_row_changed(_row):
+            _update_buttons()
+            if 0 <= _row < len(ext_info_for_row):
+                try:
+                    selected_ext_id[0] = ext_info_for_row[_row].id()
+                except Exception:
+                    selected_ext_id[0] = ""
+            else:
+                selected_ext_id[0] = ""
+
+        list_widget.currentRowChanged.connect(_on_row_changed)
+
+        def _on_remove():
+            if not selected_ext_id[0]:
+                return
+            ext_id = selected_ext_id[0]
+            confirm = QMessageBox.question(
+                dlg,
+                "Uninstall extension",
+                f"Remove '{ext_id}'?\n\n"
+                "This unloads the extension from the engine and deletes "
+                "its folder on disk. You'll need to reinstall it from the "
+                "store to use it again.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if confirm != QMessageBox.StandardButton.Yes:
+                return
+            if self.extension_loader.uninstall(ext_id):
+                self.statusBar().showMessage(f"Removed {ext_id}", 3000)
+                _refresh_list()
+
+        def _on_toggle():
+            if not selected_ext_id[0]:
+                return
+            ext_id = selected_ext_id[0]
+            # Determine current state from the live extension.
+            new_state = True
+            for ext in ext_info_for_row:
+                try:
+                    if ext.id() == ext_id:
+                        new_state = not bool(ext.isEnabled())
+                        break
+                except Exception:
+                    continue
+            if self.extension_loader.set_enabled(ext_id, new_state):
+                self.statusBar().showMessage(
+                    f"{'Enabled' if new_state else 'Disabled'} {ext_id}", 2000
+                )
+                _refresh_list()
+
+        list_widget.itemDoubleClicked.connect(lambda _it: _on_toggle())
+
+        # Action row above the dialog buttons
+        action_row = QHBoxLayout()
+        toggle_btn = QPushButton("Toggle On/Off")
+        toggle_btn.setEnabled(False)
+        toggle_btn.clicked.connect(_on_toggle)
+        action_row.addWidget(toggle_btn)
+
+        remove_btn = QPushButton("Remove")
+        remove_btn.setObjectName("RemoveBtn")
+        remove_btn.setEnabled(False)
+        remove_btn.clicked.connect(_on_remove)
+        action_row.addWidget(remove_btn)
+        action_row.addStretch(1)
+        layout.addLayout(action_row)
+
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         store_btn = buttons.addButton("Get more extensions\u2026",
                                       QDialogButtonBox.ButtonRole.ActionRole)
-        try:
-            store_btn.clicked.connect(self.show_store_dialog)
-        except Exception:
-            pass
+        def _open_store():
+            dlg.accept()  # close the extensions dialog
+            self.show_store_dialog()
+        store_btn.clicked.connect(_open_store)
         reload_btn = buttons.addButton("Reload", QDialogButtonBox.ButtonRole.ActionRole)
         reload_btn.clicked.connect(self.reload_extensions)
+        reload_btn.clicked.connect(_refresh_list)
         buttons.rejected.connect(dlg.close)
         buttons.accepted.connect(dlg.accept)
         layout.addWidget(buttons)
+        if list_widget.count() > 0 and ext_info_for_row:
+            list_widget.setCurrentRow(0)
         dlg.exec()
 
     def show_store_dialog(self):
@@ -2867,10 +3082,225 @@ class BrowserWindow(QMainWindow):
         dlg.exec()
 
     def _on_store_installed(self, extension_id: str):
+        _dl_log("install", "BrowserWindow._on_store_installed",
+                ext_id=extension_id)
         self.statusBar().showMessage(
             f"Installed {extension_id} \u2014 reloading\u2026", 3000
         )
-        self.extension_loader.install_all()
+        try:
+            self.extension_loader.install_all()
+        except Exception as e:
+            _dl_log("install", "_on_store_installed:install_all-threw",
+                    err=f"{type(e).__name__}: {e}")
+            self.statusBar().showMessage(
+                f"Reload failed: {type(e).__name__}: {e}", 5000
+            )
+        # If the popup is open, refresh it so the new row appears.
+        if getattr(self, "_extensions_popup", None) and self._extensions_popup.isVisible():
+            self._refresh_extensions_popup()
+
+    # ── Topbar extensions popup ─────────────────────────────────────
+    def toggle_extensions_popup(self):
+        """Show the extensions popup anchored under the puzzle button.
+
+        The popup is a static floating panel: it has no drag handle,
+        no dock state, and no pin/unpin button.  Clicking the puzzle
+        button again (or pressing Escape, or clicking outside)
+        dismisses it.
+        """
+        popup = getattr(self, "_extensions_popup", None)
+        if popup is None:
+            return
+        if popup.isVisible():
+            _dl_log("popup", "toggle_extensions_popup:hide")
+            popup.hide()
+            return
+        _dl_log("popup", "toggle_extensions_popup:show")
+        self._refresh_extensions_popup()
+        self._show_extensions_popup_floating()
+
+    def _show_extensions_popup_floating(self):
+        popup = self._extensions_popup
+        btn = self.chrome.extensions_btn
+        global_pos = btn.mapToGlobal(QPoint(0, btn.height() + 4))
+        width = max(popup.sizeHint().width(), popup.minimumWidth())
+        screen_w = QApplication.primaryScreen().availableGeometry().width()
+        x = max(0, min(global_pos.x() + btn.width() // 2 - width // 2,
+                       screen_w - width))
+        popup.setGeometry(x, global_pos.y(), width, popup.sizeHint().height())
+        popup.show()
+        popup.raise_()
+
+    def _on_ext_count_changed(self, _n: int):
+        """Update the puzzle-button badge and the popup contents
+        (if the popup is currently visible)."""
+        enabled_count = 0
+        try:
+            for ext in self.extension_loader.live_extensions():
+                try:
+                    if bool(ext.isEnabled()):
+                        enabled_count += 1
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        if hasattr(self, "chrome") and hasattr(self.chrome, "extensions_btn"):
+            self.chrome.extensions_btn.set_count(enabled_count)
+        popup = getattr(self, "_extensions_popup", None)
+        if popup is not None and popup.isVisible():
+            self._refresh_extensions_popup()
+
+    def _refresh_extensions_popup_theme(self):
+        popup = getattr(self, "_extensions_popup", None)
+        if popup is None:
+            return
+        popup.apply_theme(self.theme)
+
+    def _refresh_extensions_popup(self):
+        """Reload the popup's row list from the current manager state."""
+        from extensions_popup import (
+            ExtensionPopupItem,
+            read_extension_shortcut,
+        )
+        popup = getattr(self, "_extensions_popup", None)
+        if popup is None:
+            return
+        items = []
+        try:
+            for ext in self.extension_loader.live_extensions():
+                try:
+                    ext_id = ext.id()
+                except Exception:
+                    continue
+                if not ext_id:
+                    continue
+                try:
+                    name = ext.name() or ext_id
+                except Exception:
+                    name = ext_id
+                try:
+                    is_enabled = bool(ext.isEnabled())
+                except Exception:
+                    is_enabled = True
+                try:
+                    is_loaded = bool(ext.isLoaded())
+                except Exception:
+                    is_loaded = True
+                try:
+                    ext_path = ext.path() or ""
+                except Exception:
+                    ext_path = ""
+                shortcut = read_extension_shortcut(ext_path) if ext_path else ""
+                # Options URL needs the manifest.  The engine's
+                # reported path is often the cache dir (no
+                # manifest.json), so the loader falls back to
+                # ``./extensions/<name>/`` when needed.
+                options_url = ""
+                try:
+                    options_url = self.extension_loader.get_options_url(ext_id)
+                except Exception:
+                    options_url = ""
+                items.append(ExtensionPopupItem(
+                    extension_id=ext_id,
+                    name=name,
+                    is_enabled=is_enabled,
+                    is_loaded=is_loaded,
+                    shortcut=shortcut,
+                    options_url=options_url,
+                ))
+        except Exception as e:
+            print(f"[extensions] popup refresh failed: {e}")
+        popup.set_extensions(items)
+
+    def _on_popup_close(self):
+        popup = getattr(self, "_extensions_popup", None)
+        if popup is not None:
+            popup.hide()
+
+    def _on_popup_manage(self):
+        popup = getattr(self, "_extensions_popup", None)
+        if popup is not None:
+            popup.hide()
+        self.show_extensions_dialog()
+
+    def _on_popup_options(self, extension_id: str, url: str):
+        """Open the extension's options page in a new tab.
+
+        The user clicked the gear icon on a popup row.  We hide the
+        popup, open a new tab pointed at ``chrome-extension://<id>/<page>``,
+        and let the WebView render the extension's HTML directly.
+        """
+        _dl_log("enable", "BrowserWindow._on_popup_options",
+                ext_id=extension_id, url=url)
+        popup = getattr(self, "_extensions_popup", None)
+        if popup is not None:
+            popup.hide()
+        if not url or not url.startswith("chrome-extension://"):
+            self.statusBar().showMessage(
+                f"Invalid options URL for {extension_id}", 3000
+            )
+            return
+        try:
+            self.add_new_tab(url=url, private=False)
+        except Exception as e:
+            _dl_log("enable", "_on_popup_options:add_new_tab-threw",
+                    err=f"{type(e).__name__}: {e}")
+            self.statusBar().showMessage(
+                f"Could not open options: {type(e).__name__}: {e}", 5000
+            )
+
+    def _on_popup_remove_extension(self, extension_id: str):
+        confirm = QMessageBox.question(
+            self,
+            "Uninstall extension",
+            f"Remove '{extension_id}'?\n\n"
+            "This unloads the extension from the engine and deletes its "
+            "folder on disk. You'll need to reinstall it from the store "
+            "to use it again.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        ok = self.extension_loader.uninstall(extension_id)
+        if ok:
+            self.statusBar().showMessage(
+                f"Removed {extension_id}", 3000
+            )
+            # Refresh the popup so the row disappears.
+            self._refresh_extensions_popup()
+        # If the popup was empty after removal, close it.
+        popup = getattr(self, "_extensions_popup", None)
+        if popup is not None and popup.isVisible():
+            try:
+                if popup._list_layout.count() <= 1:  # only the stretch
+                    popup.hide()
+            except Exception:
+                pass
+
+    def _on_popup_toggle_extension(self, extension_id: str, enabled: bool):
+        _dl_log("enable", "BrowserWindow._on_popup_toggle_extension",
+                ext_id=extension_id, enabled=enabled)
+        try:
+            ok = self.extension_loader.set_enabled(extension_id, enabled)
+        except Exception as e:
+            _dl_log("enable", "_on_popup_toggle_extension:set_enabled-threw",
+                    ext_id=extension_id,
+                    err=f"{type(e).__name__}: {e}")
+            self.statusBar().showMessage(
+                f"Could not {'enable' if enabled else 'disable'} {extension_id}: "
+                f"{type(e).__name__}: {e}", 5000
+            )
+            return
+        if ok:
+            self.statusBar().showMessage(
+                f"{'Enabled' if enabled else 'Disabled'} {extension_id}", 2000
+            )
+        else:
+            self.statusBar().showMessage(
+                f"Could not {'enable' if enabled else 'disable'} {extension_id}",
+                3000,
+            )
 
     def _on_store_open_web(self, url: str):
         if url.startswith("http"):
@@ -3092,7 +3522,20 @@ def main():
     window.adblocker = adblocker
     extension_loader.status_changed.connect(window.on_extension_status)
     extension_loader.count_changed.connect(window.on_extension_count)
-    extension_loader.install_all()
+    # ``install_all`` schedules a uBO-Lite download on first run
+    # (which calls ``on_done`` on the GUI thread) and then proceeds
+    # to call ``loadExtension`` for every entry under
+    # ``./extensions/``.  Wrap the call so any synchronous throw
+    # is caught and surfaced via the status bar — the window must
+    # not crash on startup.
+    try:
+        extension_loader.install_all()
+    except Exception as e:
+        _dl_log("install", "main:install_all-threw",
+                err=f"{type(e).__name__}: {e}")
+        window.statusBar().showMessage(
+            f"Extension loader failed: {type(e).__name__}: {e}", 5000
+        )
 
     default_profile.downloadRequested.connect(window.on_download_requested)
     private_profile.downloadRequested.connect(window.on_download_requested)
