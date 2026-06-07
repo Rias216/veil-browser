@@ -218,29 +218,15 @@ class ExtensionLoader(QObject):
             self.status_changed.emit("No extension manager on this profile")
             return
 
-        # Build the set of already-loaded extensions so we don't
-        # double-install.  ``manager.extensions()`` returns a list of
-        # ``ExtensionInfo`` (PySide6 6.10+) or, on older bindings,
-        # ``None`` / an empty list.
-        already_loaded = set()
-        try:
-            for ext in (mgr.extensions() or []):
-                try:
-                    already_loaded.add(ext.id())
-                except Exception:
-                    pass
-        except Exception as e:
-            self.status_changed.emit(f"manager.extensions() failed: {e}")
-
         for entry in sorted(os.listdir(EXTENSIONS_DIR)):
             ext_path = os.path.join(EXTENSIONS_DIR, entry)
             if not os.path.isdir(ext_path):
                 continue
             manifest = os.path.join(ext_path, "manifest.json")
             if not os.path.isfile(manifest):
-                self.status_changed.emit(f"Skipping {entry}: no manifest.json")
                 continue
 
+            # Skip manifest-version-2 unless we know MV2 works
             if not _manifest_supports_mv3(manifest) and not _mv2_likely_works():
                 self.status_changed.emit(
                     f"Skipping {entry}: MV2 not supported on Chromium \u2265 130"
@@ -248,7 +234,10 @@ class ExtensionLoader(QObject):
                 continue
 
             try:
+                # loadExtension is async; we listen to loadFinished below
+                self._pending_mgr = mgr
                 if not hasattr(mgr, "loadFinished"):
+                    # Older binding — use installExtension
                     info = mgr.installExtension(ext_path)
                     if info is None:
                         self.status_changed.emit(
@@ -265,49 +254,17 @@ class ExtensionLoader(QObject):
                         f"Installed: {info.name() or entry}"
                     )
                 else:
+                    # Hook loadFinished once. We only connect on the first
+                    # call so we don't accumulate handlers across reloads.
                     if not getattr(self, "_load_finished_connected", False):
                         mgr.loadFinished.connect(self._on_load_finished)
                         self._load_finished_connected = True
                     mgr.loadExtension(ext_path)
-                    self.status_changed.emit(f"Loading: {entry}")
             except Exception as e:
                 self.status_changed.emit(f"Install threw for {entry}: {e}")
                 continue
 
-        # Seed ``_installed`` with the already-loaded set so the
-        # dialog shows the current population even before the async
-        # ``loadFinished`` signals fire.
-        for ext_id in already_loaded:
-            if ext_id not in self._installed:
-                self._installed[ext_id] = ext_id
-
         self.count_changed.emit(len(self._installed))
-
-    def list_installed(self):
-        """Return the live list of installed extensions from the manager.
-
-        Falls back to the local cache populated by ``loadFinished`` if
-        the manager query fails.  This is the function the dialog
-        should call instead of poking at ``self._installed`` directly.
-        """
-        if not self._supported or self.profile is None:
-            return list(self._installed.values())
-        try:
-            mgr = self.profile.extensionManager()
-            if mgr is None:
-                return list(self._installed.values())
-            result = []
-            for ext in (mgr.extensions() or []):
-                try:
-                    name = ext.name() or ext.id()
-                except Exception:
-                    name = ext.id() if hasattr(ext, "id") else "(unknown)"
-                result.append(name)
-            if result:
-                return result
-        except Exception:
-            pass
-        return list(self._installed.values())
 
     def _on_load_finished(self, info):
         try:
