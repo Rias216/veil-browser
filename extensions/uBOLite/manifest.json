@@ -54,62 +54,62 @@
       },
       {
         "id": "adguard-mobile",
-        "enabled": false,
+        "enabled": true,
         "path": "/rulesets/main/adguard-mobile.json"
       },
       {
         "id": "block-lan",
-        "enabled": false,
+        "enabled": true,
         "path": "/rulesets/main/block-lan.json"
       },
       {
         "id": "dpollock-0",
-        "enabled": false,
+        "enabled": true,
         "path": "/rulesets/main/dpollock-0.json"
       },
       {
         "id": "adguard-spyware-url",
-        "enabled": false,
+        "enabled": true,
         "path": "/rulesets/main/adguard-spyware-url.json"
       },
       {
         "id": "annoyances-ai",
-        "enabled": false,
+        "enabled": true,
         "path": "/rulesets/main/annoyances-ai.json"
       },
       {
         "id": "annoyances-cookies",
-        "enabled": false,
+        "enabled": true,
         "path": "/rulesets/main/annoyances-cookies.json"
       },
       {
         "id": "annoyances-overlays",
-        "enabled": false,
+        "enabled": true,
         "path": "/rulesets/main/annoyances-overlays.json"
       },
       {
         "id": "annoyances-social",
-        "enabled": false,
+        "enabled": true,
         "path": "/rulesets/main/annoyances-social.json"
       },
       {
         "id": "annoyances-widgets",
-        "enabled": false,
+        "enabled": true,
         "path": "/rulesets/main/annoyances-widgets.json"
       },
       {
         "id": "annoyances-others",
-        "enabled": false,
+        "enabled": true,
         "path": "/rulesets/main/annoyances-others.json"
       },
       {
         "id": "annoyances-notifications",
-        "enabled": false,
+        "enabled": true,
         "path": "/rulesets/main/annoyances-notifications.json"
       },
       {
         "id": "ublock-experimental",
-        "enabled": false,
+        "enabled": true,
         "path": "/rulesets/main/ublock-experimental.json"
       },
       {
@@ -134,7 +134,7 @@
       },
       {
         "id": "chn-0",
-        "enabled": false,
+        "enabled": true,
         "path": "/rulesets/main/chn-0.json"
       },
       {
@@ -144,7 +144,7 @@
       },
       {
         "id": "deu-0",
-        "enabled": false,
+        "enabled": true,
         "path": "/rulesets/main/deu-0.json"
       },
       {
@@ -159,7 +159,7 @@
       },
       {
         "id": "fra-0",
-        "enabled": false,
+        "enabled": true,
         "path": "/rulesets/main/fra-0.json"
       },
       {
@@ -209,12 +209,12 @@
       },
       {
         "id": "jpn-1",
-        "enabled": false,
+        "enabled": true,
         "path": "/rulesets/main/jpn-1.json"
       },
       {
         "id": "kor-1",
-        "enabled": false,
+        "enabled": true,
         "path": "/rulesets/main/kor-1.json"
       },
       {
@@ -244,7 +244,7 @@
       },
       {
         "id": "pol-0",
-        "enabled": false,
+        "enabled": true,
         "path": "/rulesets/main/pol-0.json"
       },
       {
@@ -254,7 +254,7 @@
       },
       {
         "id": "rus-0",
-        "enabled": false,
+        "enabled": true,
         "path": "/rulesets/main/rus-0.json"
       },
       {
@@ -264,7 +264,7 @@
       },
       {
         "id": "spa-0",
-        "enabled": false,
+        "enabled": true,
         "path": "/rulesets/main/spa-0.json"
       },
       {
@@ -289,12 +289,12 @@
       },
       {
         "id": "tur-0",
-        "enabled": false,
+        "enabled": true,
         "path": "/rulesets/main/tur-0.json"
       },
       {
         "id": "ukr-0",
-        "enabled": false,
+        "enabled": true,
         "path": "/rulesets/main/ukr-0.json"
       },
       {

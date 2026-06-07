@@ -42,8 +42,6 @@ from io import BytesIO
 
 from PySide6.QtCore import QObject, QThread, Signal
 
-from debug_log import log as _dl_log
-
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 EXTENSIONS_DIR = os.path.join(SCRIPT_DIR, "extensions")
 
@@ -60,20 +58,6 @@ CRX_DOWNLOAD_URL = (
 )
 CRX_SEARCH_URL = "https://chromewebstore.google.com/search/{query}"
 CRX_DETAIL_URL = "https://chromewebstore.google.com/detail/{ext_id}"
-
-# DuckDuckGo HTML endpoint — used as a fallback when the CWS search
-# page returns nothing parseable.  DDG is JS-free and serves
-# ``site:chromewebstore.google.com`` queries as plain HTML with
-# ``uddg=https%3A%2F%2Fchromewebstore.google.com%2Fdetail%2F...``
-# redirects, from which we can recover extension IDs and names.
-DDG_HTML_URL = "https://html.duckduckgo.com/html/"
-DDG_RESULT_LINK_RE = re.compile(
-    r'class="result__a"\s+href="[^"]*?uddg=([^"&]+)'
-)
-DDG_RESULT_TITLE_RE = re.compile(
-    r'class="result__a"[^>]*>(.*?)</a>', re.DOTALL
-)
-DDG_STRIP_TAGS_RE = re.compile(r"<[^>]+>")
 
 
 @dataclass
@@ -112,292 +96,218 @@ class SearchResultParser(HTMLParser):
     """Harvest ``(id, name, rating, description)`` tuples from a CWS
     search-results page.
 
-    Modern CWS markup (verified 2026) looks like this per result card::
+    The CWS server-renders each result card as a ``<div>`` carrying
+    ``data-item-id="<32-char-id>"``.  The parser uses several
+    fallbacks because Google frequently changes class names:
 
-        <div data-item-id="<32-char-id>">
-          <a class="q6LNgd" href="./detail/<slug>/<id>" aria-labelledby="i6" ...>
-          <div class="R6nElb">
-            <img ...>
-            <div class="feN2Qe">
-              <div id="i6"><h2 class="CiI2if">Extension Name</h2></div>
-              <p class="rQHEi" id="i7">description text…</p>
-              <p ...><span aria-label="Average rating 4.5 out of 5 stars.">
-                <span class="Vq0ZA">4.5</span>…
-              </span></p>
-            </div>
-          </div>
-        </div>
+    Strategy 1 — primary (works against the most recent CWS markup)
+        ``<div data-item-id="<32-char-id>">`` opens a card.
+        ``<a class="...a-no-hover-decoration" href=".../<id>">`` holds
+        the name.  Rating is in a ``<span class="...yNns">`` and the
+        description in a ``<div class="...GTRhUb">`` (or, in older
+        markup, ``<p class="g3IrHd">``).
 
-    The parser walks the page once and uses three independent
-    strategies; whichever lands first wins per card.
-
-    Strategy 1 — modern markup (the only one that works on the
-    current CWS):
-        * Card boundary: ``<div data-item-id="<32 [a-p] chars>">``.
-        * Name: the first ``<h2>`` inside the card.
-        * Rating: an ``aria-label`` of the form
-          ``"Average rating X.Y out of 5 stars."`` (or any element
-          whose text matches the decimal-numeric pattern for a value
-          between 0.0 and 5.0).
-        * Description: the first ``<p>`` after the ``<h2>``.
-
-    Strategy 2 — generic anchor harvest:
+    Strategy 2 — generic fallback
         The 32-char id can also be harvested from any ``href``
-        containing ``/detail/<id>`` (with or without a slug).  We
-        collect every such anchor, then post-process to (id, slug,
-        name) by reading the link's text and its parent ``<h2>``
-        when present.  The id regex is strict (32 chars from
-        ``[a-p]`` — the actual Chrome extension id alphabet), so
-        false positives are extremely unlikely.
+        containing ``/detail/<id>``.  The name comes from the
+        ``aria-label`` of the same ``<a>`` (CWS renders
+        ``aria-label="<name> by <author>"``) or, failing that, from
+        the link's text content.
 
-    Strategy 3 — last-resort, blank name:
-        If the page has ``data-item-id`` divs but no extractable
-        names, still emit a placeholder result so the user at least
-        gets a clickable install target.
-
-    Notes on the ID alphabet
-    -----------------------
-    Chrome extension IDs are 32 characters from the set ``[a-p]``
-    (16 letters — the first 16 of the alphabet).  Earlier
-    implementations used ``[a-z]`` which is a superset and was used
-    in the original code; we tighten to ``[a-p]`` so we don't accept
-    garbage from the surrounding HTML (e.g. base64 padding chars).
+    Strategy 3 — last-resort
+        If the card structure is completely unrecognised, we scan the
+        whole page for ``href="/detail/<32-id>"`` anchors and pair
+        them with their ``aria-label`` / inner text.  The id regex
+        is strict (lowercase 32 hex-ish letters), so false positives
+        are very unlikely.
     """
 
-    ID_RE = re.compile(r"^[a-p]{32}$")
-    ID_IN_HREF_RE = re.compile(r"/detail/(?:[a-z0-9-]+/)?([a-p]{32})")
-    RATING_LIKE_RE = re.compile(r"\b([0-5](?:\.[0-9])?)\b")
-    RATING_STAR_RE = re.compile(
-        r'aria-label="[^"]*?([0-5](?:\.[0-9])?)\s*out\s*of\s*5[^"]*"'
-    )
+    ID_RE = re.compile(r"^[a-z]{32}$")
+    ID_IN_HREF_RE = re.compile(r"/detail/([a-z]{32})")
+    RATING_RE = re.compile(r"\b([0-9](?:\.[0-9])?)\b")
+    RATING_STAR_RE = re.compile(r"aria-label=\"([0-9](?:\.[0-9])?) out of 5\"")
 
     def __init__(self):
-        super().__init__(convert_charrefs=True)
+        super().__init__()
         self.results: list = []
         self._seen: set = set()
-        # Card extraction state.
+        # Current-card extraction state.
         self._current_id: str | None = None
-        self._card_name: str = ""
-        self._card_rating: float = 0.0
-        self._card_description: str = ""
-        self._saw_h2: bool = False
-        self._saw_p: bool = False
-        # Strategy-2 anchor collection.
+        self._card_name: list = []
+        self._card_rating: str = ""
+        self._card_description: list = []
+        self._card_aria: str = ""
+        self._in_name = False
+        self._in_rating = False
+        self._in_desc = False
+        self._depth = 0
+        # Strategy-3 fallback scan.
         self._anchors: list = []
-        # Active capture target inside the current card.
-        # One of: "name" (inside <h2>), "desc" (inside <p>),
-        # "rating" (any element with a rating-ish aria-label),
-        # or None.
-        self._capture: str | None = None
-        self._capture_buf: list = []
-        # Stack of still-open <div> tags *inside* the current card
-        # so we know when the card itself closes.  Plain ints suffice
-        # — we only care about the depth counter relative to the
-        # opening div.
-        self._div_depth: int = 0
 
     # ── HTMLParser overrides ──
     def handle_starttag(self, tag, attrs):
         d = dict(attrs)
-        cls = d.get("class", "")
-        aria = d.get("aria-label", "")
+
+        # ── Strategy 1: data-item-id on a div ──
+        if self._current_id is None and tag == "div":
+            ext_id = d.get("data-item-id", "")
+            if self.ID_RE.match(ext_id) and ext_id not in self._seen:
+                self._start_card(ext_id)
+                # The opening <div data-item-id="..."> IS the card
+                # boundary.  We set _depth to 0 so the FIRST </div>
+                # we see (the one that closes this card) finalizes
+                # the extraction.  Inner <div>s increment the depth.
+                self._depth = 0
+                return
+
+        if self._current_id is not None:
+            if tag == "div":
+                self._depth += 1
+            cls = d.get("class", "")
+            aria = d.get("aria-label", "")
+
+            # Name anchor
+            if tag == "a" and (
+                ("a-no-hover-decoration" in cls)
+                or (d.get("href", "").endswith(self._current_id))
+            ):
+                if aria:
+                    self._card_aria = aria
+                self._in_name = True
+            # Rating span
+            elif tag == "span" and ("yNns" in cls or "Vq0ZA" in cls):
+                self._in_rating = True
+            # Description
+            elif tag in ("div", "p") and (
+                "GTRhUb" in cls or "g3IrHd" in cls or "pj4dy" in cls
+            ):
+                self._in_desc = True
+
+        # ── Strategy 3: collect every detail link for the fallback pass ──
         href = d.get("href", "")
-        ext_id_attr = d.get("data-item-id", "")
-
-        # ── Card boundary ──
-        if self._current_id is None and ext_id_attr and self.ID_RE.match(ext_id_attr):
-            self._start_card(ext_id_attr)
-            # We are now "inside" the card; subsequent <div>s add to
-            # _div_depth, and the first </div> at depth 0 finalises.
-            return
-
-        if self._current_id is None:
-            # Strategy 2: collect detail-link anchors outside any card.
-            if "/detail/" in href:
-                m = self.ID_IN_HREF_RE.search(href)
-                if m:
-                    self._anchors.append((m.group(1), "", ""))
-            return
-
-        # ── Inside a card ──
-        if tag == "div":
-            self._div_depth += 1
-            return
-
-        # Name: first <h2> inside the card.
-        if tag == "h2" and not self._saw_h2:
-            self._saw_h2 = True
-            self._begin_capture("name")
-            return
-
-        # Description: a <p> after the <h2> that carries a known
-        # description class (``g3IrHd``, ``GTRhUb``, ``pj4dy``).
-        # The CWS renders the description as the only <p> with text
-        # content; preceding <p> elements (e.g. ``rQHEi``) are empty
-        # placeholders or icon holders, so we explicitly check the
-        # class instead of blindly grabbing the first <p>.
-        if (
-            tag == "p"
-            and self._saw_h2
-            and not self._saw_p
-            and self._is_description_class(cls)
-        ):
-            self._saw_p = True
-            self._begin_capture("desc")
-            return
-
-        # Rating: any element whose aria-label carries "X.Y out of 5".
-        if aria and not self._card_rating:
-            m = self.RATING_STAR_RE.search('aria-label="' + aria + '"')
-            if m:
-                try:
-                    self._card_rating = float(m.group(1))
-                    return
-                except ValueError:
-                    pass
-
-        # Detail-link href inside the card → record for fallback.
         if "/detail/" in href:
             m = self.ID_IN_HREF_RE.search(href)
             if m:
-                self._anchors.append((m.group(1), "", ""))
+                self._anchors.append((m.group(1), d.get("aria-label", ""), ""))
 
     def handle_endtag(self, tag):
         if self._current_id is None:
             return
         if tag == "div":
-            # The opening <div data-item-id> sits at depth 0.  Any
-            # nested <div> bumped us up; closing it pops back down.
-            # When we get back to depth 0, the card itself is closing.
-            if self._div_depth == 0:
+            # Card boundary: the FIRST </div> after the opening
+            # one finalizes the card.  Any </div> beyond that
+            # pops a nested level.
+            if self._depth == 0:
                 self._finalize_card()
             else:
-                self._div_depth -= 1
-            return
-        if self._capture is not None and tag in ("h2", "p", "span", "div"):
-            # Whichever tag opened the capture region is what closes it.
-            self._end_capture()
+                self._depth -= 1
+        elif tag == "p":
+            if self._in_desc:
+                self._in_desc = False
+        elif tag == "a" and self._in_name:
+            self._in_name = False
+        elif tag == "span" and self._in_rating:
+            self._in_rating = False
 
     def handle_data(self, data):
         if self._current_id is None:
             return
-        if self._capture is not None:
-            self._capture_buf.append(data)
-
-    def handle_entityref(self, name):
-        # Convert &amp; / &quot; / etc. into the actual character
-        # so the name and description strings are clean.
-        ch = {
-            "amp": "&", "lt": "<", "gt": ">", "quot": '"',
-            "apos": "'", "nbsp": " ", "mdash": "—", "ndash": "–",
-            "hellip": "…", "copy": "©", "reg": "®", "trade": "™",
-        }.get(name)
-        if ch is not None and self._capture is not None:
-            self._capture_buf.append(ch)
-
-    def handle_charref(self, name):
-        # Numeric character references (e.g. &#x2605; for ★).
-        try:
-            if name.startswith(("x", "X")):
-                ch = chr(int(name[1:], 16))
-            else:
-                ch = chr(int(name))
-        except (ValueError, OverflowError):
-            return
-        if self._capture is not None:
-            self._capture_buf.append(ch)
-
-    # ── Internal capture helpers ──
-    @staticmethod
-    def _is_description_class(cls: str) -> bool:
-        """True if ``cls`` is one of the CWS description-bearing
-        classes (current: ``g3IrHd``; older markup used ``GTRhUb``
-        or ``pj4dy``).
-        """
-        return any(marker in cls for marker in ("g3IrHd", "GTRhUb", "pj4dy"))
-
-    def _begin_capture(self, target: str):
-        # If a previous capture of a different kind is still open,
-        # end it first so we don't lose data.
-        if self._capture is not None and self._capture != target:
-            self._end_capture()
-        self._capture = target
-        self._capture_buf = []
-
-    def _end_capture(self):
-        if self._capture is None:
-            return
-        text = "".join(self._capture_buf)
-        text = " ".join(text.split())
-        if self._capture == "name" and text and not self._card_name:
-            self._card_name = text
-        elif self._capture == "desc" and text and not self._card_description:
-            self._card_description = text
-        elif self._capture == "rating" and text and not self._card_rating:
-            m = self.RATING_LIKE_RE.search(text)
-            if m:
-                try:
-                    v = float(m.group(1))
-                    if 0.0 <= v <= 5.0:
-                        self._card_rating = v
-                except ValueError:
-                    pass
-        self._capture = None
-        self._capture_buf = []
+        if self._in_name:
+            self._card_name.append(data)
+        elif self._in_rating:
+            self._card_rating += data
+        elif self._in_desc:
+            self._card_description.append(data)
 
     def _start_card(self, ext_id: str):
         self._current_id = ext_id
-        self._card_name = ""
-        self._card_rating = 0.0
-        self._card_description = ""
-        self._saw_h2 = False
-        self._saw_p = False
-        self._capture = None
-        self._capture_buf = []
-        self._div_depth = 0
+        self._card_name = []
+        self._card_rating = ""
+        self._card_description = []
+        self._card_aria = ""
+        self._in_name = False
+        self._in_rating = False
+        self._in_desc = False
+        self._depth = 0
 
     def _finalize_card(self):
-        # Close any in-flight capture before deciding.
-        self._end_capture()
         ext_id = self._current_id
-        if ext_id and ext_id not in self._seen and self._card_name:
-            self._seen.add(ext_id)
-            self.results.append((
-                ext_id,
-                self._card_name,
-                self._card_rating,
-                self._card_description,
-            ))
+        if ext_id and ext_id not in self._seen:
+            name = self._extract_name()
+            if name:
+                self._seen.add(ext_id)
+                rating = self._parse_rating()
+                description = self._extract_description()
+                self.results.append((ext_id, name, rating, description))
         self._current_id = None
-        self._card_name = ""
-        self._card_rating = 0.0
-        self._card_description = ""
-        self._saw_h2 = False
-        self._saw_p = False
-        self._capture = None
-        self._capture_buf = []
-        self._div_depth = 0
+        self._card_name = []
+        self._card_rating = ""
+        self._card_description = []
+        self._card_aria = ""
+        self._in_name = False
+        self._in_rating = False
+        self._in_desc = False
+        self._depth = 0
 
-    # ── Post-pass: anchor harvest (Strategy 2) + last-resort (Strategy 3) ──
+    def _extract_name(self) -> str:
+        # Prefer aria-label "Name by Author", then collected link text.
+        if self._card_aria:
+            return self._card_aria.split(" by ", 1)[0].strip()
+        joined = "".join(self._card_name).strip()
+        return joined
+
+    def _extract_description(self) -> str:
+        raw = "".join(self._card_description)
+        return " ".join(raw.split()).strip()
+
+    def _parse_rating(self) -> float:
+        raw = self._card_rating.strip()
+        if raw:
+            try:
+                return float(raw)
+            except ValueError:
+                pass
+        m = self.RATING_STAR_RE.search(self._card_aria)
+        if m:
+            try:
+                return float(m.group(1))
+            except ValueError:
+                pass
+        # Numeric anywhere in the rating block.
+        m = self.RATING_RE.search(self._card_rating)
+        if m:
+            try:
+                v = float(m.group(1))
+                if 0.0 <= v <= 5.0:
+                    return v
+            except ValueError:
+                pass
+        return 0.0
+
+    # ── Public: post-pass that applies Strategy 3 ──
     def close(self):
-        # If the HTML was truncated mid-card, finalize whatever we have.
-        if self._current_id is not None:
-            self._finalize_card()
         super().close()
         if not self.results:
             self._fallback_from_anchors()
 
     def _fallback_from_anchors(self):
-        """Strategy 2/3 — emit at least the IDs when the card markup
-        is unrecognised, so the user gets clickable install targets.
-        Names are blank in this path; the dialog can still show the
-        32-char id and "Install" works without a name.
+        """Strategy 3 — assemble results from collected ``/detail/<id>``
+        links if no cards were parsed.
+
+        The CWS occasionally obfuscates the card markup; the per-link
+        ``aria-label`` is more stable.  We synthesise empty ratings
+        and descriptions so the user at least gets clickable results.
         """
-        for ext_id, _name, _text in self._anchors:
+        for ext_id, aria, _text in self._anchors:
             if ext_id in self._seen:
                 continue
+            name = aria.split(" by ", 1)[0].strip() if aria else ""
+            if not name:
+                # Last-ditch: extract from the rest of the link HTML —
+                # too complex to do correctly here, so skip.
+                continue
             self._seen.add(ext_id)
-            self.results.append((ext_id, "", 0.0, ""))
+            self.results.append((ext_id, name, 0.0, ""))
 
 
 class CrxUnpacker:
@@ -511,45 +421,32 @@ def install_crx_from_path(crx_path: str,
             the embedded ZIP, or an MV2 manifest on Chromium >= 130.
     """
     if not os.path.isfile(crx_path):
-        _dl_log("install", "install_crx_from_path:missing-file",
-                crx_path=crx_path)
         raise FileNotFoundError(crx_path)
     with open(crx_path, "rb") as f:
         crx_bytes = f.read()
-    _dl_log("install", "install_crx_from_path:read-crx",
-            crx_path=crx_path, bytes=len(crx_bytes))
     with tempfile.TemporaryDirectory(prefix="crx_install_") as tmp:
         CrxUnpacker.extract(crx_bytes, tmp)
-        _dl_log("install", "install_crx_from_path:unpacked",
-                tmp=tmp, files=os.listdir(tmp)[:8])
         manifest_path = os.path.join(tmp, "manifest.json")
         if not os.path.isfile(manifest_path):
-            _dl_log("install", "install_crx_from_path:no-manifest")
             raise RuntimeError("manifest.json missing after unpack")
         try:
             with open(manifest_path, "r", encoding="utf-8") as f:
                 manifest = json.load(f)
             mv = int(manifest.get("manifest_version", 0))
         except (OSError, ValueError, json.JSONDecodeError) as e:
-            _dl_log("install", "install_crx_from_path:bad-manifest",
-                    err=f"{type(e).__name__}: {e}")
             raise RuntimeError(f"Could not read manifest.json: {e}") from e
         if mv < 3 and mv2_blocked():
-            _dl_log("install", "install_crx_from_path:mv2-blocked", mv=mv)
             raise RuntimeError(
                 "This extension is MV2, which Chromium \u2265 130 rejects"
             )
         ext_id = _read_extension_id(tmp)
         if not ext_id:
-            _dl_log("install", "install_crx_from_path:no-id")
             raise RuntimeError("Could not determine extension id from manifest")
         os.makedirs(extensions_dir, exist_ok=True)
         dest = os.path.join(extensions_dir, ext_id)
         if os.path.isdir(dest):
             shutil.rmtree(dest, ignore_errors=True)
         shutil.move(tmp, dest)
-        _dl_log("install", "install_crx_from_path:moved",
-                src=tmp, dest=dest, ext_id=ext_id, mv=mv)
     return ext_id
 
 
@@ -567,111 +464,16 @@ class ChromeWebStore:
 
     def search(self, query: str, limit: int = 20) -> list:
         """Return a list of ``(extension_id, name, rating, description)``
-        tuples for ``query``.
-
-        Strategy:
-
-        1. **CWS direct.**  Hit ``chromewebstore.google.com/search/...``
-           with a real Chrome UA.  The page is server-rendered, so the
-           :class:`SearchResultParser` can usually harvest full
-           metadata (name, rating, description) per card.
-        2. **DDG HTML fallback.**  If CWS returned nothing parseable
-           (e.g. Google just redesigned the page again, or the CWS
-           server is unreachable), query DuckDuckGo's no-JS
-           ``/html/`` endpoint with ``site:chromewebstore.google.com``
-           and recover extension IDs from the result links.  Names
-           come from the result ``<a>`` text.  Ratings and
-           descriptions are not available from DDG, so the dialog
-           shows them as 0 / blank.
+        tuples harvested from the CWS search page.
         """
         if not query.strip():
             return []
-        results = self._search_cws(query.strip(), limit)
-        if results:
-            return results
-        return self._search_ddg(query.strip(), limit)
-
-    def _search_cws(self, query: str, limit: int) -> list:
-        try:
-            url = CRX_SEARCH_URL.format(query=urllib.parse.quote(query))
-            html = self._get(url).decode("utf-8", errors="ignore")
-        except Exception:
-            return []
+        url = CRX_SEARCH_URL.format(query=urllib.parse.quote(query.strip()))
+        html = self._get(url).decode("utf-8", errors="ignore")
         parser = SearchResultParser()
-        try:
-            parser.feed(html)
-        except Exception:
-            return []
-        finally:
-            try:
-                parser.close()
-            except Exception:
-                pass
+        parser.feed(html)
+        parser.close()
         return parser.results[:limit]
-
-    def _search_ddg(self, query: str, limit: int) -> list:
-        """Fallback: query DDG HTML and recover CWS extension IDs.
-
-        The DDG HTML page uses 302-style ``uddg=`` redirects encoded
-        in each result anchor.  Decoding those gives us the real
-        CWS ``/detail/<slug>/<id>`` URL, from which we can pull the
-        32-char extension id and a human-readable name.
-        """
-        try:
-            body = (
-                f"q=site%3Achromewebstore.google.com+"
-                f"{urllib.parse.quote(query)}"
-            )
-            req = urllib.request.Request(
-                DDG_HTML_URL,
-                data=body.encode("ascii"),
-                headers={
-                    "User-Agent": self.user_agent,
-                    "Content-Type": "application/x-www-form-urlencoded",
-                },
-                method="POST",
-            )
-            html = self._get_url(req).decode("utf-8", errors="ignore")
-        except Exception:
-            return []
-
-        results: list = []
-        seen: set = set()
-        # Walk the HTML in order: pair each redirect href with the
-        # following <a> title text.
-        title_iter = DDG_RESULT_TITLE_RE.finditer(html)
-        for href_match, title_match in zip(
-            DDG_RESULT_LINK_RE.finditer(html), title_iter
-        ):
-            try:
-                decoded = urllib.parse.unquote(href_match.group(1))
-            except Exception:
-                continue
-            id_match = SearchResultParser.ID_IN_HREF_RE.search(decoded)
-            if not id_match:
-                continue
-            ext_id = id_match.group(1)
-            if ext_id in seen:
-                continue
-            seen.add(ext_id)
-            title_html = title_match.group(1)
-            name = DDG_STRIP_TAGS_RE.sub("", title_html).strip()
-            # DDG titles look like "uBlock Origin Lite - Chrome Web Store";
-            # strip the trailing site name for a cleaner display.
-            for suffix in (" - Chrome Web Store", " – Chrome Web Store"):
-                if name.endswith(suffix):
-                    name = name[: -len(suffix)].strip()
-                    break
-            results.append((ext_id, name, 0.0, ""))
-            if len(results) >= limit:
-                break
-        return results
-
-    def _get_url(self, req: urllib.request.Request) -> bytes:
-        """Variant of ``_get`` that accepts a pre-built Request (so the
-        caller can control method / headers / body)."""
-        with urllib.request.urlopen(req, timeout=self.timeout) as r:
-            return r.read()
 
     def fetch_details(self, extension_id: str) -> ExtensionInfo:
         """Fetch the CWS detail page and extract rich metadata
@@ -695,12 +497,8 @@ class ChromeWebStore:
         return _parse_detail_html(html, extension_id)
 
     def download_crx(self, extension_id: str) -> bytes:
-        _dl_log("install", "ChromeWebStore.download_crx:enter",
-                ext_id=extension_id)
         url = CRX_DOWNLOAD_URL.format(ext_id=extension_id)
         data = self._get(url)
-        _dl_log("install", "ChromeWebStore.download_crx:first-bytes",
-                ext_id=extension_id, bytes=len(data), head=data[:8])
         if data.startswith(b"<?xml") or data.startswith(b"<gupdate"):
             m = re.search(rb'codebase="([^"]+)"', data)
             if not m:
@@ -778,20 +576,9 @@ class _InstallWorker(QObject):
         tmp_path = None
         try:
             if self._stop:
-                _dl_log("install", "_InstallWorker.run:stopped-before-start",
-                        ext_id=self.extension_id)
                 return
-            _dl_log("install", "_InstallWorker.run:start",
-                    ext_id=self.extension_id)
             self.progress.emit(f"Downloading {self.extension_id}\u2026", 10)
-            try:
-                crx_bytes = self.store.download_crx(self.extension_id)
-            except Exception as e:
-                _dl_log("install", "_InstallWorker.run:download-failed",
-                        ext_id=self.extension_id, err=f"{type(e).__name__}: {e}")
-                raise
-            _dl_log("install", "_InstallWorker.run:download-ok",
-                    ext_id=self.extension_id, bytes=len(crx_bytes))
+            crx_bytes = self.store.download_crx(self.extension_id)
             if self._stop:
                 return
             with tempfile.NamedTemporaryFile(
@@ -801,13 +588,9 @@ class _InstallWorker(QObject):
                 tmp_path = tmp.name
             self.progress.emit("Installing\u2026", 60)
             ext_id = install_crx_from_path(tmp_path, extensions_dir=self.extensions_dir)
-            _dl_log("install", "_InstallWorker.run:unpack-ok",
-                    ext_id=self.extension_id, installed_id=ext_id)
             self.progress.emit("Installed", 100)
             self.finished.emit(self.extension_id, True, f"Installed {ext_id}")
         except Exception as e:
-            _dl_log("install", "_InstallWorker.run:exception",
-                    ext_id=self.extension_id, err=f"{type(e).__name__}: {e}")
             self.finished.emit(self.extension_id, False, str(e))
         finally:
             if tmp_path is not None:
@@ -831,10 +614,7 @@ class ExtensionStore(QObject):
         self._inflight: dict = {}
 
     def install_extension(self, extension_id: str) -> None:
-        _dl_log("install", "install_extension:enter", ext_id=extension_id)
         if extension_id in self._inflight:
-            _dl_log("install", "install_extension:already-inflight",
-                    ext_id=extension_id)
             return
         thread = QThread()
         worker = _InstallWorker(
@@ -852,7 +632,6 @@ class ExtensionStore(QObject):
         thread.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
         self._inflight[extension_id] = (thread, worker)
-        _dl_log("install", "install_extension:thread-start", ext_id=extension_id)
         thread.start()
 
     def search(self, query: str, limit: int = 20) -> list:
@@ -876,8 +655,6 @@ class ExtensionStore(QObject):
         self.download_progress.emit(message, percent)
 
     def _on_finished(self, extension_id: str, ok: bool, message: str) -> None:
-        _dl_log("install", "ExtensionStore._on_finished",
-                ext_id=extension_id, ok=ok, message=message)
         self.install_complete.emit(extension_id, ok, message)
         info = self._inflight.pop(extension_id, None)
         if info is None:
