@@ -2738,10 +2738,23 @@ class BrowserWindow(QMainWindow):
 
     # ── Extensions ───────────────────────────────────────────────────
     def show_extensions_dialog(self):
-        manager = self.default_profile.extensionManager()
-        installed = manager.extensions()
         t = self.theme
         c = t.colors
+
+        installed = []
+        manager = None
+        try:
+            manager = self.default_profile.extensionManager()
+        except Exception as e:
+            print(f"[extensions] extensionManager() unavailable: {e}")
+
+        if manager is not None:
+            try:
+                raw = manager.extensions()
+                if raw is not None:
+                    installed = list(raw)
+            except Exception as e:
+                print(f"[extensions] Could not list extensions: {e}")
 
         dlg = QDialog(self)
         dlg.setWindowTitle("Extensions")
@@ -2800,21 +2813,68 @@ class BrowserWindow(QMainWindow):
             try:
                 item = QListWidgetItem(f"{ext.name()}  \u2014  {ext.id()}")
             except Exception:
-                item = QListWidgetItem(str(ext.id()))
+                try:
+                    item = QListWidgetItem(str(ext.id()))
+                except Exception:
+                    item = QListWidgetItem(str(ext))
             list_widget.addItem(item)
-        if installed is None or len(installed) == 0:
+        if not installed:
             placeholder = QListWidgetItem("(no extensions loaded)")
             placeholder.setFlags(Qt.ItemFlag.NoItemFlags)
             list_widget.addItem(placeholder)
         layout.addWidget(list_widget)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        store_btn = buttons.addButton("Get more extensions\u2026",
+                                      QDialogButtonBox.ButtonRole.ActionRole)
+        try:
+            store_btn.clicked.connect(self.show_store_dialog)
+        except Exception:
+            pass
         reload_btn = buttons.addButton("Reload", QDialogButtonBox.ButtonRole.ActionRole)
         reload_btn.clicked.connect(self.reload_extensions)
         buttons.rejected.connect(dlg.close)
         buttons.accepted.connect(dlg.accept)
         layout.addWidget(buttons)
         dlg.exec()
+
+    def show_store_dialog(self):
+        try:
+            from extension_store import ExtensionStore
+            from extension_store_dialog import ExtensionStoreDialog
+        except Exception as e:
+            print(f"[extensions] store dialog not available: {e}")
+            return
+
+        # Cache the store on the window so we don't spin up
+        # a fresh thread pool every time the dialog is opened.
+        if not hasattr(self, "_extension_store") or self._extension_store is None:
+            try:
+                self._extension_store = ExtensionStore(self.settings)
+            except Exception as e:
+                print(f"[extensions] could not init ExtensionStore: {e}")
+                return
+
+        dlg = ExtensionStoreDialog(self._extension_store, self)
+        try:
+            dlg.installed.connect(self._on_store_installed)
+        except Exception:
+            pass
+        try:
+            dlg.open_in_browser.connect(self._on_store_open_web)
+        except Exception:
+            pass
+        dlg.exec()
+
+    def _on_store_installed(self, extension_id: str):
+        self.statusBar().showMessage(
+            f"Installed {extension_id} \u2014 reloading\u2026", 3000
+        )
+        self.extension_loader.install_all()
+
+    def _on_store_open_web(self, url: str):
+        if url.startswith("http"):
+            self.navigate_to_url(url)
 
     def reload_extensions(self):
         self.extension_loader.install_all()
