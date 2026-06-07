@@ -18,13 +18,15 @@ from PySide6.QtGui import (
     QBrush, QRadialGradient, QFontMetrics
 )
 from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QTabWidget, QToolBar, QLineEdit,
+    QApplication, QMainWindow, QToolBar, QLineEdit,
     QPushButton, QProgressBar, QFileDialog, QMenu, QStatusBar,
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QMessageBox, QTabBar,
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QMessageBox,
     QDialog, QListWidget, QListWidgetItem, QDialogButtonBox,
     QStyle, QStyleOptionButton, QStackedWidget, QSizePolicy,
-    QSpacerItem, QFrame, QGraphicsDropShadowEffect
+    QSpacerItem, QFrame, QGraphicsDropShadowEffect,
+    QStyledItemDelegate
 )
+from PySide6.QtGui import QPalette
 from PySide6.QtWebEngineCore import (
     QWebEngineProfile, QWebEnginePage, QWebEngineSettings
 )
@@ -53,6 +55,16 @@ SPOOFED_UA = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/122.0.0.0 Safari/537.36"
 )
+
+
+def _resolve_font(family_string, pixel_size=13):
+    font = QFont()
+    families = [f.strip().strip("'\"") for f in family_string.split(",")]
+    font.setFamilies(families)
+    font.setPixelSize(pixel_size)
+    font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
+    font.setHintingPreference(QFont.HintingPreference.PreferFullHinting)
+    return font
 
 
 # ── Identity Manager ─────────────────────────────────────────────────
@@ -141,64 +153,82 @@ class WebPage(QWebEnginePage):
         return new_view.page()
 
 
-# ── VeilTabBar ───────────────────────────────────────────────────────
-class VeilTabBar(QTabBar):
-    """Completely redone tab bar: inactive tabs get a visible subtle bg,
-    active tab draws a clean top/side border path (no half-pixel bottom artifacts)."""
+# ── ChromeTabBar ───────────────────────────────────────────────────
+class ChromeTabBar(QWidget):
+    """Chrome-like tab bar — fully custom painted with favicons, loading
+    spinners, hover/close animations, drag-reorder, scroll overflow,
+    middle-click close, and keyboard navigation."""
 
-    CLOSE_SIZE = 16
-    BTM_LINE = 1
-    MIN_TAB_WIDTH = 100   # minimum px per tab — enough for ~8 chars + close button
+    TAB_HEIGHT = 30
+    MIN_TAB_WIDTH = 72
+    MAX_TAB_WIDTH = 200
+    TAB_RADIUS = 7
+    CLOSE_SIZE = 14
+    FAVICON_SIZE = 14
+    BTM_DIVIDER = 1
+    SCROLL_BTN_W = 22
+    SCROLL_BTN_MARGIN = 2
+    NEW_TAB_BTN_W = 28
 
-    doubleClickedEmpty = Signal()
+    AUDIO_SIZE = 10
 
-    def tabSizeHint(self, index):
-        base = super().tabSizeHint(index)
-        return QSize(max(self.MIN_TAB_WIDTH, base.width()), base.height())
+    LEFT_PAD = 6
+    RIGHT_PAD = 6
+    FAV_GAP = 4
+    CLOSE_GAP = 3
+
+    tabCloseRequested = Signal(int)
+    tabSelected = Signal(int)
+    newTabRequested = Signal()
+    tabMoved = Signal(int, int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setObjectName("VeilTabBar")
-        self.setTabsClosable(False)
-        self.setMovable(True)
-        self.setDrawBase(False)
-        self.setDocumentMode(True)
-        self.setExpanding(True)          # fill available space when few tabs
-        self.setUsesScrollButtons(True)
-        self.setElideMode(Qt.TextElideMode.ElideRight)
-
-        t = self._theme()
-        self.setFixedHeight(t.tab_height)
-        self.setMinimumWidth(0)
-        self._tab_radius = t.tab_radius
-
-        # ── Hover tracking ──
+        self.setObjectName("ChromeTabBar")
+        self.setFixedHeight(self.TAB_HEIGHT)
         self.setMouseTracking(True)
-        self._hovered_index = -1
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setAcceptDrops(True)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+        self._tabs = []
+        self._current = -1
+        self._hovered = -1
         self._hovered_close = -1
         self._pressed_close = -1
+        self._scroll_offset = 0
+        self._tab_rects = []
+        self._total_width = 0
+        self._has_overflow = False
+        self._hover_scroll_left = False
+        self._hover_scroll_right = False
+        self._hover_new_tab = False
 
-        # ─️ Paint generation tracking (skip redundant inactive tab draws) ──
-        self._paint_gen = 0       # incremented when tab layout changes
-        self._last_painted_gen = -1
+        self._drag_idx = -1
+        self._drag_start_x = 0
+        self._is_dragging = False
 
-        # ── Close button fade ──
+        self._hover_fade = 0.0
+        self._hover_anim = QVariantAnimation(self)
+        self._hover_anim.setDuration(150)
+        self._hover_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._hover_anim.valueChanged.connect(self._on_hover_step)
+
         self._close_fade = 0.0
-        self._close_fade_anim = QVariantAnimation(self)
-        self._close_fade_anim.setDuration(120)
-        self._close_fade_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-        self._close_fade_anim.valueChanged.connect(self._on_fade_step)
-        self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
-        self.setAcceptDrops(True)
-        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        self._close_anim = QVariantAnimation(self)
+        self._close_anim.setDuration(150)
+        self._close_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._close_anim.valueChanged.connect(self._on_close_step)
 
-    def _on_fade_step(self, v):
-        self._close_fade = v
-        idx = self._hovered_index
-        if idx >= 0:
-            self.update(self._close_rect(idx))
-        else:
-            self.update()
+        self._spinner_angle = 0
+        self._spinner_timer = QTimer(self)
+        self._spinner_timer.setInterval(30)
+        self._spinner_timer.timeout.connect(self._spin_step)
+
+        self._scroll_timer = QTimer(self)
+        self._scroll_timer.setInterval(100)
+        self._scroll_timer.timeout.connect(self._scroll_tick)
 
     def _theme(self):
         win = self.window()
@@ -207,74 +237,434 @@ class VeilTabBar(QTabBar):
         from themes import THEMES
         return list(THEMES.values())[0]
 
-    def _close_rect(self, index):
-        tr = self.tabRect(index)
-        size = self.CLOSE_SIZE
-        return QRect(tr.right() - size - 6,
-                     tr.y() + (tr.height() - size) // 2,
-                     size, size)
+    def _on_hover_step(self, v):
+        self._hover_fade = v
+        if self._hovered >= 0 and self._hovered < len(self._tab_rects):
+            self.update(self._tab_rects[self._hovered])
 
-    # ── Mouse event forwarding ──
-    def _hover_index(self, pos):
-        for i in range(self.count()):
-            if self.tabRect(i).contains(pos):
+    def _on_close_step(self, v):
+        self._close_fade = v
+        if self._hovered_close >= 0:
+            self.update(self._close_rect(self._hovered_close))
+        elif self._hovered >= 0:
+            self.update(self._close_rect(self._hovered))
+
+    def _spin_step(self):
+        self._spinner_angle = (self._spinner_angle + 30) % 360
+        for i in range(len(self._tabs)):
+            p = self._tabs[i].get("progress", -1)
+            if 0 <= p < 100:
+                self._repaint_tab(i)
+
+    # ── Tab data management ──
+
+    def addTab(self, index=None, title="", icon=None):
+        data = {"title": title or "New Tab", "icon": icon, "progress": -1, "is_private": False, "is_playing": False}
+        if index is None or index >= len(self._tabs):
+            self._tabs.append(data)
+            new_idx = len(self._tabs) - 1
+        else:
+            self._tabs.insert(index, data)
+            new_idx = index
+        self._recalc()
+        return new_idx
+
+    def removeTab(self, index):
+        if 0 <= index < len(self._tabs):
+            self._tabs.pop(index)
+            old = self._current
+            if self._current >= len(self._tabs):
+                self._current = len(self._tabs) - 1 if len(self._tabs) > 0 else -1
+            self._recalc()
+            if self._current != old and self._current >= 0:
+                self.tabSelected.emit(self._current)
+
+    def setTabText(self, index, text):
+        if 0 <= index < len(self._tabs):
+            old_w = self._get_tab_width(self._tabs[index]["title"])
+            new_w = self._get_tab_width(text)
+            self._tabs[index]["title"] = text
+            if abs(new_w - old_w) > 2:
+                self._recalc()
+            else:
+                self.update()
+
+    def _get_tab_width(self, title):
+        fm = QFontMetrics(self._tab_font())
+        text_w = fm.horizontalAdvance(title)
+        audio_space = self.AUDIO_SIZE + self.FAV_GAP
+        natural = (self.LEFT_PAD + self.FAVICON_SIZE + self.FAV_GAP + text_w
+                   + audio_space + self.CLOSE_GAP + self.CLOSE_SIZE + self.RIGHT_PAD)
+        return max(self.MIN_TAB_WIDTH, min(self.MAX_TAB_WIDTH, natural))
+
+    def tabText(self, index):
+        if 0 <= index < len(self._tabs):
+            return self._tabs[index]["title"]
+        return ""
+
+    def setTabIcon(self, index, icon):
+        if 0 <= index < len(self._tabs):
+            self._tabs[index]["icon"] = icon
+            self.update()
+
+    def setTabProgress(self, index, progress):
+        if 0 <= index < len(self._tabs):
+            self._tabs[index]["progress"] = progress
+            self.update()
+            self._update_spinner_timer()
+
+    def _update_spinner_timer(self):
+        any_loading = any(0 <= t.get("progress", -1) < 100 for t in self._tabs)
+        if any_loading and not self._spinner_timer.isActive():
+            self._spinner_timer.start()
+        elif not any_loading and self._spinner_timer.isActive():
+            self._spinner_timer.stop()
+
+    def setPrivate(self, index, private):
+        if 0 <= index < len(self._tabs):
+            self._tabs[index]["is_private"] = private
+            self.update()
+
+    def setCurrentIndex(self, index):
+        if index != self._current:
+            old = self._current
+            self._current = index
+            if old >= 0:
+                self._repaint_tab(old)
+            if index >= 0:
+                self._repaint_tab(index)
+            self.tabSelected.emit(index)
+
+    def currentIndex(self):
+        return self._current
+
+    def count(self):
+        return len(self._tabs)
+
+    def invalidate_layout(self):
+        self._recalc()
+
+    # ── Layout ──
+
+    def _tab_btn_area(self):
+        return (self.SCROLL_BTN_W * 2 + 4) if self._has_overflow else 0
+
+    def _new_tab_btn_area(self):
+        return self.NEW_TAB_BTN_W + 2
+
+    def _available_width(self):
+        return max(50, self.width() - self._tab_btn_area() - self._new_tab_btn_area())
+
+    def _recalc(self):
+        w = self.width()
+        self._tab_rects = []
+        tab_count = len(self._tabs)
+        if tab_count == 0:
+            self._total_width = 0
+            self._has_overflow = False
+            self.update()
+            return
+
+        natural_widths = [self._get_tab_width(t["title"]) for t in self._tabs]
+        total_natural = sum(natural_widths)
+
+        available_if_not = max(50, w - self._new_tab_btn_area())
+        self._has_overflow = total_natural > available_if_not
+
+        if self._has_overflow:
+            for nw in natural_widths:
+                cw = max(self.MIN_TAB_WIDTH, min(self.MAX_TAB_WIDTH, nw))
+                self._tab_rects.append(QRect(0, 0, cw, self.TAB_HEIGHT))
+            self._total_width = sum(r.width() for r in self._tab_rects)
+        else:
+            available = self._available_width()
+            extra = max(0, available - total_natural)
+            per_tab = extra // tab_count
+            x = 0
+            for nw in natural_widths:
+                cw = min(self.MAX_TAB_WIDTH, max(self.MIN_TAB_WIDTH, nw) + per_tab)
+                self._tab_rects.append(QRect(x, 0, cw, self.TAB_HEIGHT))
+                x += cw
+            self._total_width = x
+
+        self._clamp_scroll()
+        self.update()
+
+    def _clamp_scroll(self):
+        if not self._has_overflow:
+            self._scroll_offset = 0
+            return
+        max_off = max(0, self._total_width - self._available_width())
+        self._scroll_offset = max(0, min(self._scroll_offset, max_off))
+
+    def _tab_font(self, selected=False):
+        t = self._theme()
+        font = _resolve_font(t.font_family, 12)
+        font.setWeight(QFont.Weight.Medium if selected else QFont.Weight.Normal)
+        return font
+
+    def _tab_at(self, pos):
+        ox = self._tab_start_x()
+        for i, r in enumerate(self._tab_rects):
+            tr = QRect(r.x() + ox - self._scroll_offset, r.y(), r.width(), r.height())
+            if tr.contains(pos):
                 return i
         return -1
 
-    def mouseMoveEvent(self, event):
-        super().mouseMoveEvent(event)
-        pos = event.position().toPoint()
-        idx = self._hover_index(pos)
-        old_hover = self._hovered_index
-        old_close = self._hovered_close
-        new_close = idx if idx >= 0 and self._close_rect(idx).contains(pos) else -1
+    def _tab_rect_at(self, index):
+        if 0 <= index < len(self._tab_rects):
+            r = self._tab_rects[index]
+            ox = self._tab_start_x()
+            return QRect(r.x() + ox - self._scroll_offset, r.y(), r.width(), r.height())
+        return QRect()
 
-        self._hovered_index = idx
+    def _tab_start_x(self):
+        return self.SCROLL_BTN_W * 2 + 4 if self._has_overflow else 0
+
+    def _scroll_left_rect(self):
+        s = self.SCROLL_BTN_W
+        return QRect(2, (self.TAB_HEIGHT - s) // 2, s, s)
+
+    def _scroll_right_rect(self):
+        s = self.SCROLL_BTN_W
+        return QRect(2 + s + 2, (self.TAB_HEIGHT - s) // 2, s, s)
+
+    def _new_tab_rect(self):
+        right_edge = self.width()
+        size = self.NEW_TAB_BTN_W
+        return QRect(right_edge - size - 2, (self.TAB_HEIGHT - size) // 2,
+                     size, size)
+
+    def _close_rect(self, index):
+        tr = self._tab_rect_at(index)
+        if tr:
+            return QRect(tr.right() - self.CLOSE_SIZE - self.RIGHT_PAD,
+                         tr.y() + (tr.height() - self.CLOSE_SIZE) // 2,
+                         self.CLOSE_SIZE, self.CLOSE_SIZE)
+        return QRect()
+
+    def _favicon_rect(self, index):
+        tr = self._tab_rect_at(index)
+        if tr:
+            return QRect(tr.x() + self.LEFT_PAD,
+                         tr.y() + (tr.height() - self.FAVICON_SIZE) // 2,
+                         self.FAVICON_SIZE, self.FAVICON_SIZE)
+        return QRect()
+
+    def _repaint_tab(self, idx):
+        if 0 <= idx < len(self._tab_rects):
+            self.update(self._tab_rect_at(idx))
+
+    def is_drag_area(self, global_pos):
+        local = self.mapFromGlobal(global_pos)
+        if not self.rect().contains(local):
+            return False
+        if self._tab_at(local) >= 0:
+            return False
+        if self._new_tab_rect().contains(local):
+            return False
+        if self._has_overflow:
+            if self._scroll_left_rect().contains(local) or self._scroll_right_rect().contains(local):
+                return False
+        return True
+
+    # ── Events ──
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._recalc()
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Tab and event.modifiers() == Qt.KeyboardModifier.ControlModifier:
+            nxt = (self._current + 1) % len(self._tabs) if self._tabs else 0
+            self.setCurrentIndex(nxt)
+            event.accept()
+            return
+        if event.key() == Qt.Key.Key_Tab and event.modifiers() == (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier):
+            prv = (self._current - 1) % len(self._tabs) if self._tabs else 0
+            self.setCurrentIndex(prv)
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        pos = event.position().toPoint()
+        idx = self._tab_at(pos)
+        old_hover = self._hovered
+        old_close = self._hovered_close
+        new_close = -1
+
+        if idx >= 0:
+            if self._close_rect(idx).contains(pos):
+                new_close = idx
+
+        self._hovered = idx
         self._hovered_close = new_close
 
-        # Only repaint when hover state actually changes — avoids paint storms
         if idx != old_hover:
-            if old_hover >= 0:
-                self.update(self.tabRect(old_hover))
-            if idx >= 0:
-                self.update(self.tabRect(idx))
+            if old_hover >= 0 and old_hover != self._current:
+                self._start_hover_anim(0.0)
+            if idx >= 0 and idx != self._current:
+                self._start_hover_anim(1.0)
+            self._repaint_tab(old_hover)
+            self._repaint_tab(idx)
         elif new_close != old_close and idx >= 0:
-            # Close button hover changed within same tab — minimal repaint
+            self._start_close_anim(1.0 if new_close >= 0 else 0.0)
             self.update(self._close_rect(idx))
 
+        if old_close >= 0 and new_close < 0:
+            self._start_close_anim(0.0)
+            self.update(self._close_rect(old_close))
+
+        scroll_arrow = False
+        if self._has_overflow:
+            sr = self._scroll_right_rect()
+            sl = self._scroll_left_rect()
+            new_sl = sl.contains(pos) and self._scroll_offset > 0
+            new_sr = sr.contains(pos) and self._scroll_offset < max(0, self._total_width - (self.width() - self.SCROLL_BTN_W * 2 - self.NEW_TAB_BTN_W))
+            if new_sl != self._hover_scroll_left or new_sr != self._hover_scroll_right:
+                self._hover_scroll_left = new_sl
+                self._hover_scroll_right = new_sr
+                scroll_arrow = True
+                self.update(sl)
+                self.update(sr)
+                if new_sl or new_sr:
+                    if not self._scroll_timer.isActive():
+                        self._scroll_timer.start()
+                else:
+                    self._scroll_timer.stop()
+
+        ntr = self._new_tab_rect()
+        new_nt = ntr.contains(pos)
+        if new_nt != self._hover_new_tab:
+            self._hover_new_tab = new_nt
+            self.update(ntr)
+
+        if not scroll_arrow and not new_nt:
+            if self._scroll_timer.isActive() and not (self._hover_scroll_left or self._hover_scroll_right):
+                self._scroll_timer.stop()
+
+        if self._drag_idx >= 0 and event.buttons() == Qt.MouseButton.LeftButton:
+            if not self._is_dragging:
+                dx = abs(pos.x() - self._drag_start_x)
+                if dx >= 8:
+                    self._is_dragging = True
+            if self._is_dragging:
+                target = self._tab_at(pos)
+                if target >= 0 and target != self._drag_idx:
+                    self._move_tab(self._drag_idx, target)
+                    self._drag_idx = target
+
     def mousePressEvent(self, event):
-        super().mousePressEvent(event)
         pos = event.position().toPoint()
-        idx = self._hover_index(pos)
-        pressed_close = idx >= 0 and event.button() == Qt.MouseButton.LeftButton and self._close_rect(idx).contains(pos)
-        self._pressed_close = idx if pressed_close else -1
-        if idx >= 0:
-            self.update(self._close_rect(idx) if pressed_close else self.tabRect(idx))
+        idx = self._tab_at(pos)
+        if event.button() == Qt.MouseButton.LeftButton:
+            if self._new_tab_rect().contains(pos):
+                self.newTabRequested.emit()
+                event.accept()
+                return
+            if self._has_overflow:
+                if self._scroll_left_rect().contains(pos) and self._scroll_offset > 0:
+                    self._scroll_offset = max(0, self._scroll_offset - 40)
+                    self.update()
+                    return
+                if self._scroll_right_rect().contains(pos):
+                    max_off = max(0, self._total_width - (self.width() - self.SCROLL_BTN_W * 2 - self.NEW_TAB_BTN_W))
+                    self._scroll_offset = min(max_off, self._scroll_offset + 40)
+                    self.update()
+                    return
+            if idx >= 0:
+                if self._close_rect(idx).contains(pos):
+                    self._pressed_close = idx
+                    self.update(self._close_rect(idx))
+                else:
+                    self._drag_idx = idx
+                    self._drag_start_x = pos.x()
+                    self._is_dragging = False
+                    self.setCurrentIndex(idx)
+        elif event.button() == Qt.MouseButton.MiddleButton:
+            if idx >= 0:
+                self.tabCloseRequested.emit(idx)
 
     def mouseReleaseEvent(self, event):
-        super().mouseReleaseEvent(event)
         if self._pressed_close >= 0:
             pos = event.position().toPoint()
             if self._close_rect(self._pressed_close).contains(pos):
                 self.tabCloseRequested.emit(self._pressed_close)
             self._pressed_close = -1
             self.update()
+        self._drag_idx = -1
+        self._is_dragging = False
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            pos = event.position().toPoint()
+            idx = self._tab_at(pos)
+            if idx < 0:
+                ntr = self._new_tab_rect()
+                if not ntr.contains(pos):
+                    self.newTabRequested.emit()
+            else:
+                self.tabCloseRequested.emit(idx)
 
     def leaveEvent(self, event):
-        super().leaveEvent(event)
-        old = self._hovered_index
-        self._hovered_index = -1
+        old = self._hovered
+        old_close = self._hovered_close
+        self._hovered = -1
         self._hovered_close = -1
-        self._pressed_close = -1
-        if old >= 0:
-            self.update(self.tabRect(old))
-
-    # ── Invalidate tab layout cache (call when tabs added/removed/renamed) ──
-    def invalidate_layout(self):
-        self._paint_gen += 1
+        self._hover_scroll_left = False
+        self._hover_scroll_right = False
+        self._hover_new_tab = False
+        self._scroll_timer.stop()
+        if old >= 0 and old != self._current:
+            self._start_hover_anim(0.0)
+        if old_close >= 0:
+            self._start_close_anim(0.0)
+        self._repaint_tab(old)
         self.update()
 
+    def _scroll_tick(self):
+        if self._hover_scroll_left and self._scroll_offset > 0:
+            self._scroll_offset = max(0, self._scroll_offset - 20)
+            self.update()
+        elif self._hover_scroll_right:
+            max_off = max(0, self._total_width - (self.width() - self.SCROLL_BTN_W * 2 - self.NEW_TAB_BTN_W))
+            if self._scroll_offset < max_off:
+                self._scroll_offset = min(max_off, self._scroll_offset + 20)
+                self.update()
+            else:
+                self._scroll_timer.stop()
+        else:
+            self._scroll_timer.stop()
+
+    def _start_hover_anim(self, target):
+        self._hover_anim.stop()
+        self._hover_anim.setStartValue(self._hover_fade)
+        self._hover_anim.setEndValue(target)
+        self._hover_anim.start()
+
+    def _start_close_anim(self, target):
+        self._close_anim.stop()
+        self._close_anim.setStartValue(self._close_fade)
+        self._close_anim.setEndValue(target)
+        self._close_anim.start()
+
+    def _move_tab(self, fr, to):
+        if fr == to:
+            return
+        tab = self._tabs.pop(fr)
+        self._tabs.insert(to, tab)
+        if self._current == fr:
+            self._current = to
+        elif fr < self._current <= to:
+            self._current -= 1
+        elif to <= self._current < fr:
+            self._current += 1
+        self._recalc()
+        self.tabMoved.emit(fr, to)
+
     # ── Painting ──
+
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
@@ -284,175 +674,233 @@ class VeilTabBar(QTabBar):
         c = t.colors
         h = self.height()
         w = self.width()
-        r = self._tab_radius
-        full_redraw = self._paint_gen != self._last_painted_gen
+        r = self.TAB_RADIUS
 
-        # ── 1. Bottom divider line (full width) ──
-        painter.fillRect(0, h - self.BTM_LINE, w, self.BTM_LINE, QColor(c.divider))
+        painter.fillRect(0, 0, w, h, QColor(c.tab_bar_bg))
+        painter.fillRect(0, h - self.BTM_DIVIDER, w, self.BTM_DIVIDER, QColor(c.divider))
 
-        # ── 2. Inactive tabs ──
-        if full_redraw:
-            # Full redraw: backgrounds + labels + close buttons
-            for i in range(self.count()):
-                if i == self.currentIndex():
-                    continue
-                tr = self.tabRect(i)
-                if tr.isNull():
-                    continue
-                self._draw_inactive(painter, i, tr, t, c, r)
-            self._last_painted_gen = self._paint_gen
-        else:
-            # Quick pass: only close buttons + hover overlay (expensive bg fill skipped)
-            for i in range(self.count()):
-                if i == self.currentIndex():
-                    continue
-                tr = self.tabRect(i)
-                if tr.isNull():
-                    continue
-                # Draw close button (small area — cheap even for 50 tabs)
-                if i == self._hovered_index:
-                    self._draw_close(painter, i, t, c)
-            # Hover overlay (single tab — always cheap)
-            hi = self._hovered_index
-            if hi >= 0 and hi != self.currentIndex():
-                tr = self.tabRect(hi)
-                if not tr.isNull():
-                    fill = QRectF(tr).adjusted(2, 0, -2, 0)
-                    path = QPainterPath()
-                    path.addRoundedRect(fill, r, r)
-                    painter.setPen(Qt.PenStyle.NoPen)
-                    painter.fillPath(path, QColor(c.tab_hover))
+        if self._has_overflow:
+            self._draw_scroll_buttons(painter, t, c)
 
-        # ── 3. Active tab on top (always drawn — always dynamic) ──
-        ai = self.currentIndex()
-        if 0 <= ai < self.count():
-            tr = self.tabRect(ai)
-            if not tr.isNull():
-                self._draw_active(painter, ai, tr, t, c, r)
+        for i in range(len(self._tabs)):
+            if i != self._current:
+                self._draw_tab(painter, i, False, t, c, r)
+
+        if 0 <= self._current < len(self._tabs):
+            self._draw_tab(painter, self._current, True, t, c, r)
+
+        self._draw_new_tab_button(painter, t, c)
 
         painter.end()
 
-    # ── Shared tab shape primitives ──
+    def _draw_scroll_buttons(self, painter, t, c):
+        lr = self._scroll_left_rect()
+        rr = self._scroll_right_rect()
 
-    @staticmethod
-    def _tab_fill_path(rect, radius, extend_bottom=0):
-        """Rounded-rect path for the tab body, optionally extended past bottom."""
-        r = min(radius, rect.width() / 2.0, (rect.height() + extend_bottom) / 2.0)
-        fill = QRectF(rect.x(), rect.y(), rect.width(), rect.height() + extend_bottom)
-        path = QPainterPath()
-        path.addRoundedRect(fill, r, r)
-        return path
-
-    @staticmethod
-    def _tab_border_path(rect, r):
-        """Stroke path for top + left + right border ONLY — no bottom edge.
-        Prevents 0.5px 'tails' past the divider line."""
-        x, y = rect.x(), rect.y()
-        x2, y2 = x + rect.width(), y + rect.height()
-        r = min(r, rect.width() / 2.0, rect.height() / 2.0)
-        path = QPainterPath()
-        path.moveTo(x, y2)
-        path.lineTo(x, y + r)
-        path.quadTo(x, y, x + r, y)
-        path.lineTo(x2 - r, y)
-        path.quadTo(x2, y, x2, y + r)
-        path.lineTo(x2, y2)
-        return path
-
-    # ── Tab drawing ──
-
-    def _draw_inactive(self, painter, index, tab_rect, t, c, r):
-        is_hovered = index == self._hovered_index
-        fill = QRectF(tab_rect).adjusted(1, 0, -1, 0)
-        path = self._tab_fill_path(fill, r, extend_bottom=0)
-
-        # Base fill: visible separation from toolbar_bg
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.fillPath(path, QColor(c.tab_inactive_bg))
-
-        # Hover overlay
-        if is_hovered:
-            painter.fillPath(path, QColor(c.tab_hover))
-
-        # Subtle right divider between adjacent inactive tabs
-        if index + 1 < self.count() and index + 1 != self.currentIndex():
-            x = tab_rect.right()
-            painter.setPen(QPen(QColor(c.divider), 0.5))
-            painter.drawLine(QPointF(x, tab_rect.top() + 4),
-                             QPointF(x, tab_rect.bottom() - 4))
-
-        self._draw_label(painter, index, tab_rect, is_hovered, False, t, c)
-
-    def _draw_active(self, painter, index, tab_rect, t, c, r):
-        # Fill extends +2px past bottom to cover the BTM_LINE divider
-        path = self._tab_fill_path(QRectF(tab_rect), r, extend_bottom=2)
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.fillPath(path, QColor(c.tab_active))
-
-        # Border: top + left + right edges only (no bottom "tails")
-        border_path = self._tab_border_path(QRectF(tab_rect), r)
-        painter.setPen(QPen(QColor(c.tab_active_border), 0.5))
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.drawPath(border_path)
-
-        self._draw_label(painter, index, tab_rect, False, True, t, c)
-
-    def _draw_label(self, painter, index, tab_rect, is_hovered, is_selected, t, c):
-        show_close = is_selected or is_hovered
-        close_w = (self.CLOSE_SIZE + 12) if show_close else 0
-        text_left = tab_rect.left() + 10
-        text_right = tab_rect.right() - close_w
-        text_rect = QRect(int(text_left), tab_rect.top() + 1,
-                          max(0, int(text_right - text_left)), tab_rect.height() - 2)
-
-        font = QFont("Segoe UI Variable Text,Segoe UI" if platform.system() == "Windows" else "SF Pro Display")
-        font.setPixelSize(12)
-        font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
-        font.setHintingPreference(QFont.HintingPreference.PreferFullHinting)
-        font.setWeight(QFont.Weight.Medium if is_selected else QFont.Weight.Normal)
-
-        painter.setFont(font)
-        if is_selected:
-            painter.setPen(QColor(c.text))
-        elif is_hovered:
-            painter.setPen(QColor(c.text))
-        else:
+        for rect, hovered, is_left in [(lr, self._hover_scroll_left, True), (rr, self._hover_scroll_right, False)]:
+            bg = QColor(c.surface_hover)
+            bg.setAlphaF(bg.alphaF() * (0.7 if hovered else 0.0))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QBrush(bg))
+            path = QPainterPath()
+            path.addRoundedRect(QRectF(rect), 5, 5)
+            painter.drawPath(path)
             col = QColor(c.text)
-            col.setAlphaF(0.75)
-            painter.setPen(col)
-        title = self.tabText(index)
-        if title:
-            fm = QFontMetrics(font)
-            elided = fm.elidedText(title, Qt.TextElideMode.ElideRight, text_rect.width())
-            painter.drawText(text_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, elided)
+            col.setAlphaF(col.alphaF() * (0.7 if hovered else 0.35))
+            pen = QPen(col, 1.6)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            cx, cy = rect.center().x(), rect.center().y()
+            s = 4.0
+            if is_left:
+                painter.drawLine(QPointF(cx + s, cy - s), QPointF(cx - s, cy))
+                painter.drawLine(QPointF(cx + s, cy + s), QPointF(cx - s, cy))
+            else:
+                painter.drawLine(QPointF(cx - s, cy - s), QPointF(cx + s, cy))
+                painter.drawLine(QPointF(cx - s, cy + s), QPointF(cx + s, cy))
+
+    def _draw_new_tab_button(self, painter, t, c):
+        rect = self._new_tab_rect()
+        bg = QColor(c.surface_hover)
+        bg.setAlphaF(bg.alphaF() * (0.8 if self._hover_new_tab else 0.0))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(bg))
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(rect), 6, 6)
+        painter.drawPath(path)
+        col = QColor(c.text)
+        col.setAlphaF(col.alphaF() * (0.9 if self._hover_new_tab else 0.45))
+        pen = QPen(col, 1.6)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        cx, cy = rect.center().x(), rect.center().y()
+        s = 5
+        painter.drawLine(QPointF(cx - s, cy), QPointF(cx + s, cy))
+        painter.drawLine(QPointF(cx, cy - s), QPointF(cx, cy + s))
+
+    def _draw_tab(self, painter, index, is_active, t, c, r):
+        tr = self._tab_rect_at(index)
+        if tr.isNull():
+            return
+
+        data = self._tabs[index]
+        is_hovered = index == self._hovered and not is_active
+
+        if is_active:
+            fill_rect = QRectF(tr).adjusted(0, 0, 0, self.BTM_DIVIDER + 1)
+            path = QPainterPath()
+            path.addRoundedRect(fill_rect, r, r)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.fillPath(path, QColor(c.tab_active))
+
+            gradient = QLinearGradient(0, tr.top(), 0, tr.bottom())
+            highlight = QColor(c.tab_active).lighter(108)
+            highlight.setAlphaF(0.35)
+            gradient.setColorAt(0.0, highlight)
+            gradient.setColorAt(1.0, QColor(c.tab_active))
+            painter.fillPath(path, QBrush(gradient))
+
+            x, y, x2, y2 = tr.x(), tr.y(), tr.right(), tr.bottom()
+            rr = min(r, tr.width() / 2.0, tr.height() / 2.0)
+            bp = QPainterPath()
+            bp.moveTo(x, y2)
+            bp.lineTo(x, y + rr)
+            bp.quadTo(x, y, x + rr, y)
+            bp.lineTo(x2 - rr, y)
+            bp.quadTo(x2, y, x2, y + rr)
+            bp.lineTo(x2, y2)
+            painter.setPen(QPen(QColor(c.tab_active_border), 0.5))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawPath(bp)
+        else:
+            fill_rect = QRectF(tr)
+            path = QPainterPath()
+            path.addRoundedRect(fill_rect, r, r)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.fillPath(path, QColor(c.tab_inactive_bg))
+
+            if is_hovered and self._hover_fade > 0.01:
+                hc = QColor(c.tab_hover)
+                hc.setAlphaF(hc.alphaF() * self._hover_fade)
+                painter.fillPath(path, hc)
+
+            if index + 1 < len(self._tabs) and index + 1 != self._current:
+                x = tr.right()
+                dc = QColor(c.text)
+                dc.setAlphaF(0.12)
+                painter.setPen(QPen(dc, 0.5))
+                painter.drawLine(QPointF(x, tr.top() + 4), QPointF(x, tr.bottom() - 4))
+
+        fr = self._favicon_rect(index)
+        progress = data.get("progress", -1)
+
+        if 0 <= progress < 100:
+            self._draw_spinner(painter, fr, progress, t, c)
+        elif data["icon"] is not None and not data["icon"].isNull():
+            pixmap = data["icon"].pixmap(self.FAVICON_SIZE, self.FAVICON_SIZE)
+            if not pixmap.isNull():
+                painter.drawPixmap(fr, pixmap)
+
+        if data.get("is_private"):
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QBrush(QColor(c.lock_secure)))
+            painter.drawEllipse(QRectF(fr).adjusted(4, 4, -4, -4))
+
+        text_x = fr.right() + self.FAV_GAP
+        if data.get("is_playing"):
+            audio_r = QRect(text_x, tr.y() + (tr.height() - self.AUDIO_SIZE) // 2,
+                            self.AUDIO_SIZE, self.AUDIO_SIZE)
+            self._draw_audio_indicator(painter, audio_r, t, c)
+            text_x = audio_r.right() + self.FAV_GAP
+
+        show_close = is_active or index == self._hovered or (self._hovered_close >= 0 and index == self._hovered_close)
+        font = self._tab_font(is_active)
+        painter.setFont(font)
+        painter.setPen(QColor(c.text if is_active else c.text_secondary))
+
+        text_x = fr.right() + self.FAV_GAP
+        text_right = (self._close_rect(index).left() - self.CLOSE_GAP) if show_close else (tr.right() - self.RIGHT_PAD)
+        text_w = max(0, text_right - text_x)
+
+        if text_w > 0:
+            text_rect = QRect(int(text_x), tr.top() + 1, int(text_w), tr.height() - 2)
+            title = data["title"]
+            if title:
+                fm = QFontMetrics(font)
+                elided = fm.elidedText(title, Qt.TextElideMode.ElideRight, text_w)
+                painter.drawText(text_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, elided or "")
 
         if show_close:
             self._draw_close(painter, index, t, c)
 
-    def _draw_close(self, painter, index, t, c):
-        rect = self._close_rect(index)
-        cx = rect.center().x()
-        cy = rect.center().y()
-        is_hover = index == self._hovered_close
-        is_pressed = index == self._pressed_close
-
-        # Circle bg only on hover/press (Chrome behavior)
-        if is_hover or is_pressed:
-            bg_col = QColor(c.surface_hover if not is_pressed else c.surface_pressed)
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QBrush(bg_col))
-            painter.drawEllipse(QPointF(cx, cy), 8.0, 8.0)
-
-        # × glyph
+    def _draw_audio_indicator(self, painter, rect, t, c):
+        cx, cy = rect.center().x(), rect.center().y()
+        s = 4.0
         col = QColor(c.text)
-        if not (is_hover or is_pressed):
-            col.setAlphaF(0.55)
+        col.setAlphaF(0.7)
         pen = QPen(col, 1.2)
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         painter.setPen(pen)
-        s = 3.0
-        painter.drawLine(QPointF(cx - s, cy - s), QPointF(cx + s, cy + s))
-        painter.drawLine(QPointF(cx + s, cy - s), QPointF(cx - s, cy + s))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+
+        speaker = QPainterPath()
+        speaker.moveTo(cx - s + 1, cy - 1.5)
+        speaker.lineTo(cx - 1, cy - 1.5)
+        speaker.lineTo(cx + 1.5, cy - s + 1)
+        speaker.lineTo(cx + 1.5, cy + s - 1)
+        speaker.lineTo(cx - 1, cy + 1.5)
+        speaker.lineTo(cx - s + 1, cy + 1.5)
+        speaker.closeSubpath()
+        painter.drawPath(speaker)
+
+        painter.drawArc(QRectF(cx + 1.5, cy - s + 1, s - 1, (s - 1) * 2), -60 * 16, 120 * 16)
+        painter.drawArc(QRectF(cx + 1.5 + 2, cy - s + 1 - 1, s - 1, (s - 1) * 2 + 2), -60 * 16, 120 * 16)
+
+    def _draw_spinner(self, painter, rect, progress, t, c):
+        cx, cy = rect.center().x(), rect.center().y()
+        radius = 7.0
+        pen = QPen(QColor(c.accent), 1.8)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        start_angle = (self._spinner_angle - 90) * 16
+        span = int(max(1, min(270, progress * 3.6 * 16)))
+        painter.drawArc(QRectF(cx - radius, cy - radius, radius * 2, radius * 2),
+                        start_angle, span)
+
+    def _draw_close(self, painter, index, t, c):
+        rect = self._close_rect(index)
+        cx, cy = rect.center().x(), rect.center().y()
+        is_hover = index == self._hovered_close
+        is_pressed = index == self._pressed_close
+        is_active = index == self._current
+
+        if is_hover or is_pressed:
+            fade = self._close_fade if not is_pressed else 1.0
+            bg = QColor(c.surface_hover if not is_pressed else c.surface_pressed)
+            bg.setAlphaF(bg.alphaF() * fade)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QBrush(bg))
+            painter.drawEllipse(QPointF(cx, cy), 8.0, 8.0)
+
+        col = QColor(c.text)
+        if is_hover:
+            fade = max(self._close_fade, 0.15)
+            alpha = 0.5 + (1.0 - 0.5) * fade
+        elif is_active:
+            alpha = 0.35
+        else:
+            alpha = 0.12
+        col.setAlphaF(alpha)
+        if alpha > 0.01:
+            pen = QPen(col, 1.5)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            painter.setPen(pen)
+            s = 3.2
+            painter.drawLine(QPointF(cx - s, cy - s), QPointF(cx + s, cy + s))
+            painter.drawLine(QPointF(cx + s, cy - s), QPointF(cx - s, cy + s))
 
 
 # ── ChromeButton ─────────────────────────────────────────────────────
@@ -749,6 +1197,56 @@ class NavButton(QPushButton):
             painter.drawPath(door)
 
 
+# ── SuggestionDelegate ──────────────────────────────────────────────
+class SuggestionDelegate(QStyledItemDelegate):
+    """Paints suggestion items with a magnifying-glass icon via QPainter."""
+
+    def paint(self, painter, option, index):
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        text = index.data(Qt.ItemDataRole.DisplayRole)
+        if not text:
+            painter.restore()
+            return
+
+        # Strip leading icon prefix if present
+        display = text
+        if display and len(display) > 2 and display[0] in ('\u2315', '\U0001f50d'):
+            display = display[2:] if display[1:2] == ' ' else display[1:]
+
+        # Selection/hover background
+        if option.state & QStyle.StateFlag.State_MouseOver or option.state & QStyle.StateFlag.State_Selected:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QBrush(option.palette.color(QPalette.ColorRole.Highlight)))
+            painter.drawRoundedRect(QRectF(option.rect).adjusted(4, 2, -4, -2), 6, 6)
+
+        # Magnifying glass icon
+        icon_color = option.palette.color(QPalette.ColorRole.Text)
+        icon_color.setAlpha(160)
+        pen = QPen(icon_color, 1.3)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+
+        cx = option.rect.x() + 16
+        cy = option.rect.center().y()
+        circle = QRectF(cx - 4, cy - 4, 7.5, 7.5)
+        painter.drawEllipse(circle)
+        painter.drawLine(QPointF(cx + 2, cy + 2), QPointF(cx + 5.5, cy + 5.5))
+
+        # Text
+        painter.setPen(option.palette.color(QPalette.ColorRole.Text))
+        text_rect = option.rect.adjusted(30, 0, -8, 0)
+        painter.drawText(text_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, display)
+
+        painter.restore()
+
+    def sizeHint(self, option, index):
+        return QSize(0, 32)
+
+
 # ── SearchSuggestionPopup ────────────────────────────────────────────
 class SearchSuggestionPopup(QFrame):
     """Dropdown suggestion list anchored below the address bar."""
@@ -780,6 +1278,7 @@ class SearchSuggestionPopup(QFrame):
         self.list_widget.setMouseTracking(True)
         self.list_widget.itemClicked.connect(self._on_item_clicked)
         self.list_widget.itemEntered.connect(self._on_item_entered)
+        self.list_widget.setItemDelegate(SuggestionDelegate(self.list_widget))
         layout.addWidget(self.list_widget)
 
         # Shadow for depth (avoids "sharp" flat look)
@@ -802,7 +1301,6 @@ class SearchSuggestionPopup(QFrame):
     def apply_theme(self, theme):
         c = theme.colors
         is_dark = theme.mode == ThemeMode.DARK
-        shadow_color = "rgba(0, 0, 0, 0.32)" if is_dark else "rgba(0, 0, 0, 0.12)"
         self.setStyleSheet(f"""
             SearchSuggestionPopup {{
                 background-color: {c.suggestion_bg};
@@ -817,16 +1315,13 @@ class SearchSuggestionPopup(QFrame):
                 font-size: 13px;
                 padding: 4px;
             }}
-            QListWidget::item {{
-                padding: 7px 12px;
-                border-radius: 8px;
-                margin: 1px 4px;
-            }}
-            QListWidget::item:hover, QListWidget::item:selected {{
-                background-color: {c.suggestion_hover};
-                color: {c.text};
-            }}
         """)
+        # Set palette for the delegate (highlight = hover/selected bg)
+        pal = self.list_widget.palette()
+        pal.setColor(QPalette.ColorRole.Highlight, QColor(c.suggestion_hover))
+        pal.setColor(QPalette.ColorRole.Text, QColor(c.suggestion_text))
+        pal.setColor(QPalette.ColorRole.Base, QColor(c.suggestion_bg))
+        self.list_widget.setPalette(pal)
         # Update shadow color for depth
         self._shadow.setColor(QColor(0, 0, 0, 80) if is_dark else QColor(0, 0, 0, 40))
         self._theme_applied = True
@@ -839,14 +1334,10 @@ class SearchSuggestionPopup(QFrame):
             self.hide()
             return
         for s in suggestions:
-            item = QListWidgetItem(self._format_suggestion(s))
+            item = QListWidgetItem(s)
             item.setData(Qt.ItemDataRole.UserRole, s)
             self.list_widget.addItem(item)
         self._position_and_show()
-
-    def _format_suggestion(self, text):
-        """Show suggestion with a search icon prefix (Brave-style)."""
-        return "\u2315  " + text
 
     def _position_and_show(self):
         bar = self.address_bar
@@ -911,7 +1402,6 @@ class AddressBar(QLineEdit):
     suggestionRequested = Signal(str)
 
     LOCK_AREA = 20   # pixels reserved on left for lock icon
-    LOCK_X = 10      # x position of lock center (centered within ~20px padding)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -985,11 +1475,7 @@ class AddressBar(QLineEdit):
         old_secure = self._is_secure
         old_local = self._is_local
         self._is_local = lower.startswith("file://")
-        self._is_secure = (
-            not url_str
-            or lower.startswith("https://")
-            or self._is_local
-        )
+        self._is_secure = lower.startswith("https://") and bool(url_str)
         if old_secure != self._is_secure or old_local != self._is_local:
             self.update()
 
@@ -998,12 +1484,6 @@ class AddressBar(QLineEdit):
         self._has_focus = True
         self.focused.emit()
         self._start_focus_anim(True)
-
-    def focusOutEvent(self, event):
-        super().focusOutEvent(event)
-        self._has_focus = False
-        self.blurred.emit()
-        self._start_focus_anim(False)
 
     def _theme(self):
         win = self.window()
@@ -1032,13 +1512,13 @@ class AddressBar(QLineEdit):
         rect = QRectF(self.rect()).adjusted(1, 1, -1, -1)
         r = min(rect.height() / 2.0, t.radius_full)
 
-        # Subtle focus glow — barely-there white tint, not accent-colored
+        # Subtle focus glow — accent-colored
         if fp > 0.01:
             glow_rect = QRectF(self.rect()).adjusted(-1, -1, 1, 1)
             glow_path = QPainterPath()
             glow_path.addRoundedRect(glow_rect, r + 2, r + 2)
-            glow_color = QColor(255, 255, 255)
-            glow_color.setAlphaF(0.06 * fp)
+            glow_color = QColor(c.accent)
+            glow_color.setAlphaF(0.10 * fp)
             bg_painter.setPen(Qt.PenStyle.NoPen)
             bg_painter.setBrush(QBrush(glow_color))
             bg_painter.drawPath(glow_path)
@@ -1067,12 +1547,6 @@ class AddressBar(QLineEdit):
         else:
             # Unfocused with scheme: draw manually with colored scheme
             self._draw_colored_url()
-
-        # 3. Draw lock icon overlay
-        lock_painter = QPainter(self)
-        lock_painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        self._draw_lock_icon(lock_painter, c)
-        lock_painter.end()
 
     def _draw_colored_url(self):
         """Draw the URL with the scheme part in green (Brave-style)."""
@@ -1126,76 +1600,6 @@ class AddressBar(QLineEdit):
 
         painter.restore()
         painter.end()
-
-    def _draw_lock_icon(self, painter, c):
-        cx = float(self.LOCK_X)
-        cy = self.height() / 2.0
-
-        if self._is_local:
-            self._draw_file_icon(painter, cx, cy, c)
-            return
-
-        color = QColor(c.lock_secure if self._is_secure else c.lock_insecure)
-        pen = QPen(color, 1.5)
-        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-        painter.setPen(pen)
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-
-        self._draw_lock_body(painter, cx, cy, color)
-        self._draw_lock_shackle(painter, cx, cy, color)
-        self._draw_lock_keyhole(painter, cx, cy, color)
-
-    def _draw_file_icon(self, painter, cx, cy, c):
-        """Simple document outline for local files."""
-        painter.setPen(QPen(QColor(c.text_tertiary), 1.0))
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        doc = QRectF(cx - 4, cy - 5, 7, 9)
-        doc_path = QPainterPath()
-        doc_path.moveTo(doc.x(), doc.y() + 2.5)
-        doc_path.lineTo(doc.x(), doc.bottom())
-        doc_path.lineTo(doc.right(), doc.bottom())
-        doc_path.lineTo(doc.right(), doc.y())
-        doc_path.lineTo(doc.x() + 2, doc.y())
-        doc_path.lineTo(doc.x(), doc.y() + 2.5)
-        painter.drawPath(doc_path)
-        for dy in [-1.5, 0.5, 2.5]:
-            painter.drawLine(QPointF(cx - 2, cy + dy), QPointF(cx + 2, cy + dy))
-
-    def _draw_lock_body(self, painter, cx, cy, color):
-        """Rounded rectangle body of the padlock."""
-        bw, bh = 7.0, 5.5
-        body_rect = QRectF(cx - bw / 2, cy - 0.5, bw, bh)
-        body_path = QPainterPath()
-        body_path.addRoundedRect(body_rect, 1.5, 1.5)
-        painter.drawPath(body_path)
-
-    def _draw_lock_shackle(self, painter, cx, cy, color):
-        """Shackle arc — closed (secure) or open (insecure)."""
-        sr = 2.6
-        sx = cx - sr
-        sy = cy - 0.5 - sr * 1.1
-        shackle_rect = QRectF(sx, sy, sr * 2, sr * 2)
-
-        if self._is_secure:
-            path = QPainterPath()
-            path.arcMoveTo(shackle_rect, 0)
-            path.arcTo(shackle_rect, 0, 180)
-        else:
-            open_rect = QRectF(sx + 2.5, sy - 2.0, sr * 2, sr * 2)
-            path = QPainterPath()
-            path.arcMoveTo(open_rect, 0)
-            path.arcTo(open_rect, 0, 180)
-        painter.drawPath(path)
-
-    def _draw_lock_keyhole(self, painter, cx, cy, color):
-        """Small filled dot in the lock body."""
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QBrush(color))
-        bw, bh = 7.0, 5.5
-        kx = cx - 0.7
-        ky = cy - 0.5 + bh * 0.35 - 0.7
-        painter.drawEllipse(QRectF(kx, ky, 1.4, 1.4))
 
     # ── Suggestion methods ────────────────────────────────────────────
 
@@ -1267,6 +1671,7 @@ class AddressBar(QLineEdit):
         super().focusOutEvent(event)
         self._has_focus = False
         self.blurred.emit()
+        self._start_focus_anim(False)
         self.update()
         # Hide popup on focus loss (with small delay so clicks register)
         QTimer.singleShot(150, self._popup.hide)
@@ -1293,7 +1698,7 @@ class ChromeBar(QWidget):
     STRIP_BTN_SIZE = 26       # "+" button in tab strip
     TOOLBAR_MARGIN = 2        # vertical padding inside toolbar
     NAV_SPACING = 4           # gap between nav cluster and address bar
-    TOOLBAR_PADDING = 4       # horizontal edge padding
+    TOOLBAR_PADDING = 6       # horizontal edge padding
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1364,7 +1769,7 @@ class ChromeBar(QWidget):
         toolbar_layout.addSpacing(self.NAV_SPACING)
         self._add_address_bar(toolbar_layout)
         toolbar_layout.addSpacing(self.NAV_SPACING)
-        self._add_shield_button(toolbar_layout)
+        self._add_home_button(toolbar_layout)
 
     def _add_nav_buttons(self, layout):
         self.back_btn = NavButton('back')
@@ -1382,26 +1787,20 @@ class ChromeBar(QWidget):
         self.reload_btn.clicked.connect(self.reloadRequested)
         layout.addWidget(self.reload_btn)
 
-        self.home_btn = NavButton('home')
-        self.home_btn.setToolTip("Home")
-        self.home_btn.clicked.connect(self.homeRequested)
-        layout.addWidget(self.home_btn)
-
     def _add_address_bar(self, layout):
         self.address_bar = AddressBar()
         self.address_bar.setPlaceholderText("Search or enter address")
         self.address_bar.returnPressed.connect(self._on_url_submit)
         layout.addWidget(self.address_bar, 1)
 
-    def _add_shield_button(self, layout):
-        self.shield_btn = AdBlockButton()
-        self.shield_btn.setObjectName("ShieldBtn")
-        self.shield_btn.setToolTip("No threats blocked")
-        self.shield_btn.setCursor(Qt.CursorShape.ArrowCursor)
-        layout.addWidget(self.shield_btn)
+    def _add_home_button(self, layout):
+        self.home_btn = NavButton('home')
+        self.home_btn.setToolTip("Home")
+        self.home_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.home_btn.clicked.connect(self.homeRequested)
+        layout.addWidget(self.home_btn)
 
     def addTabBar(self, tab_bar):
-        # Insert VeilTabBar at position 0, so layout becomes: [tabs][+ button][stretch]
         self.tab_bar_layout.insertWidget(0, tab_bar)
 
     def _on_url_submit(self):
@@ -1419,13 +1818,6 @@ class ChromeBar(QWidget):
     def setNavigationState(self, can_back, can_forward):
         self.back_btn.setNavigationEnabled(can_back)
         self.forward_btn.setNavigationEnabled(can_forward)
-
-    def setShieldCount(self, n):
-        self.shield_btn.setCount(n)
-        if n == 0:
-            self.shield_btn.setToolTip("No threats blocked")
-        else:
-            self.shield_btn.setToolTip(f"{n} ads/trackers blocked")
 
     def setTabCount(self, n):
         """Show tab count when overflow threshold is reached."""
@@ -1450,10 +1842,6 @@ class ChromeBar(QWidget):
             }}
             QWidget#TabBarContainer {{
                 background-color: transparent;
-            }}
-            VeilTabBar {{
-                background-color: transparent;
-                qproperty-drawBase: 0;
             }}
             QWidget#Toolbar {{
                 background-color: {c.toolbar_bg};
@@ -1501,6 +1889,9 @@ class ChromeBar(QWidget):
             QLineEdit:focus {{
                 background-color: transparent;
                 border: none;
+            }}
+            QLineEdit::placeholder {{
+                color: {c.text_tertiary};
             }}
         """)
 
@@ -1599,7 +1990,7 @@ class TrafficLightButton(QPushButton):
 class TitleBar(QWidget):
     """Mac OS-style title bar with traffic light controls and page title."""
 
-    TITLE_HEIGHT = 28
+    TITLE_HEIGHT = 34
 
     PROFILE_PILL_HEIGHT = 18  # height of profile indicator pill
 
@@ -1720,6 +2111,42 @@ class TitleBar(QWidget):
         event.accept()
 
 
+# ── TabContent ───────────────────────────────────────────────────────
+class TabContent(QStackedWidget):
+    """Manages web view content pages synced with a ChromeTabBar."""
+
+    def __init__(self, tab_bar, parent=None):
+        super().__init__(parent)
+        self.tab_bar = tab_bar
+        self.tab_bar.tabSelected.connect(self._on_tab_selected)
+
+    def addTab(self, widget, title, private=False):
+        self.addWidget(widget)
+        idx = self.tab_bar.addTab(title=title)
+        self.tab_bar.setPrivate(idx, private)
+        return idx
+
+    def removeTab(self, index):
+        w = self.widget(index)
+        self.removeWidget(w)
+        self.tab_bar.removeTab(index)
+
+    def tabText(self, index):
+        return self.tab_bar.tabText(index)
+
+    def setTabText(self, index, text):
+        self.tab_bar.setTabText(index, text)
+
+    def setCurrentIndex(self, index):
+        if self.currentIndex() != index:
+            super().setCurrentIndex(index)
+        self.tab_bar.setCurrentIndex(index)
+
+    def _on_tab_selected(self, index):
+        if 0 <= index < self.count() and index != self.currentIndex():
+            super().setCurrentIndex(index)
+
+
 # ── BrowserWindow ────────────────────────────────────────────────────
 class BrowserWindow(QMainWindow):
     def __init__(self, settings, extension_loader, default_profile, private_profile, identity_manager):
@@ -1787,18 +2214,12 @@ class BrowserWindow(QMainWindow):
         self.main_layout.addWidget(self.progress_bar)
 
     def init_tabs(self):
-        self.tabs = QTabWidget()
-        self.tabs.setDocumentMode(True)
-        self.tabs.setTabsClosable(False)
-        self.tabs.setMovable(True)
-        self.tabs.tabBarDoubleClicked.connect(self.on_tab_bar_double_clicked)
-        self.tabs.currentChanged.connect(self.on_tab_changed)
-
-        self.tab_bar = VeilTabBar(self.tabs)
+        self.tab_bar = ChromeTabBar()
         self.tab_bar.tabCloseRequested.connect(self.close_tab)
-        self.tab_bar.doubleClickedEmpty.connect(lambda: self.add_new_tab())
-        self.tabs.setTabBar(self.tab_bar)
-        self.tabs.setTabPosition(QTabWidget.TabPosition.North)
+        self.tab_bar.newTabRequested.connect(lambda: self.add_new_tab())
+        self.tab_bar.tabSelected.connect(self.on_tab_changed)
+
+        self.tabs = TabContent(self.tab_bar)
 
         self.chrome.addTabBar(self.tab_bar)
 
@@ -1891,15 +2312,6 @@ class BrowserWindow(QMainWindow):
                 color: {c.text};
                 font-family: {t.font_family};
                 font-size: {t.font_size};
-            }}
-            QTabWidget::pane {{
-                border: none;
-                background-color: {c.bg};
-            }}
-            QTabBar {{
-                background: transparent;
-                border: none;
-                qproperty-drawBase: 0;
             }}
             QMenu {{
                 background-color: {c.toolbar_bg};
@@ -2027,7 +2439,7 @@ class BrowserWindow(QMainWindow):
         self.statusBar().showMessage(f"Theme: {self.theme.label}", 2000)
 
     # ── Native window events (Windows: resize, snap, shadow) ──────────
-    RESIZE_MARGIN = 5  # px from each edge for resize grip
+    RESIZE_MARGIN = 8  # px from each edge for resize grip
 
     def nativeEvent(self, eventType, message):
         """Handle Windows WM_NCHITTEST for resize + Aero Snap support."""
@@ -2102,6 +2514,19 @@ class BrowserWindow(QMainWindow):
                     else:
                         return (True, 1)  # HTCLIENT — let buttons work
 
+                # Check tab strip area (ChromeTabBar background) for Aero Snap
+                try:
+                    tb = self.tab_bar
+                    tb_global = tb.mapToGlobal(QPoint(0, 0))
+                    in_tab_strip = (
+                        tb_global.x() <= x <= tb_global.x() + tb.width()
+                        and tb_global.y() <= y <= tb_global.y() + tb.height()
+                    )
+                    if in_tab_strip and tb.is_drag_area(QPoint(x, y)):
+                        return (True, 2)  # HTCAPTION
+                except Exception:
+                    pass
+
                 return (True, 1)  # HTCLIENT — default
 
         return (False, 0)
@@ -2155,9 +2580,7 @@ class BrowserWindow(QMainWindow):
 
         view.load(url)
 
-        index = self.tabs.addTab(view, title)
-        if private:
-            self.tabs.setTabText(index, f"\U0001f512 {title}")
+        index = self.tabs.addTab(view, title, private=private)
         self.tabs.setCurrentIndex(index)
         self.chrome.setTabCount(self.tabs.count())
         self.tab_bar.invalidate_layout()
@@ -2182,15 +2605,8 @@ class BrowserWindow(QMainWindow):
             self.tabs.removeTab(index)
             view.deleteLater()
             self.chrome.setTabCount(self.tabs.count())
-            self.tab_bar.invalidate_layout()
         else:
             self.close()
-
-    def on_tab_bar_double_clicked(self, index):
-        if index == -1:
-            self.add_new_tab()
-        else:
-            self.close_tab(index)
 
     def on_tab_changed(self, index):
         if index < 0:
@@ -2205,22 +2621,17 @@ class BrowserWindow(QMainWindow):
                 self.setWindowTitle("Veil")
             else:
                 self.chrome.setUrl(url)
-                # Update title bar with current tab title
                 title = self.tabs.tabText(index)
-                clean = title.replace("\U0001f512 ", "")
-                self.title_bar.set_title(clean)
-                self.setWindowTitle(clean + " — Veil")
+                self.title_bar.set_title(title)
+                self.setWindowTitle(title + " — Veil")
 
     def update_tab_title(self, view, title):
         index = self.tabs.indexOf(view)
         if index != -1:
-            is_private = view.property("is_private")
             clean_title = title if title else "New Tab"
-            if is_private:
-                self.tabs.setTabText(index, f"\U0001f512 {clean_title}")
-            else:
-                self.tabs.setTabText(index, clean_title)
-            # Update the custom title bar if this is the current tab
+            is_private = view.property("is_private")
+            self.tabs.setTabText(index, clean_title)
+            self.tab_bar.setPrivate(index, is_private)
             if index == self.tabs.currentIndex():
                 self.title_bar.set_title(clean_title)
                 self.setWindowTitle(clean_title + " — Veil")
@@ -2441,9 +2852,6 @@ class BrowserWindow(QMainWindow):
                 )
         self.adblocker.update_from_url(on_done=_on_done)
 
-    def on_adblock_count_changed(self, n):
-        self.chrome.setShieldCount(n)
-
     def set_search_engine(self, name, url):
         self.settings.set("search_engine_name", name)
         self.settings.set("search_engine", url)
@@ -2578,10 +2986,8 @@ def main():
     app = QApplication(sys.argv)
 
     # ── Global font: smooth, crisp text everywhere ──────────────────
-    base_font = QFont(
-        "Segoe UI" if platform.system() == "Windows" else "SF Pro Display"
-    )
-    base_font.setPixelSize(13)
+    theme = get_theme(settings.get("theme"))
+    base_font = _resolve_font(theme.font_family, 13)
     base_font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
     base_font.setHintingPreference(QFont.HintingPreference.PreferFullHinting)
     app.setFont(base_font)
@@ -2624,7 +3030,6 @@ def main():
         default_profile, private_profile, identity_manager
     )
     window.adblocker = adblocker
-    adblocker.count_changed.connect(window.on_adblock_count_changed)
     extension_loader.status_changed.connect(window.on_extension_status)
     extension_loader.count_changed.connect(window.on_extension_count)
     extension_loader.install_all()
