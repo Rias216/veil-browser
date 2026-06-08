@@ -11,5 +11,6 @@
     "search_engine_name": "DuckDuckGo",
     "homepage": "https://duckduckgo.com",
     "theme": "void",
-    "update_adblock_on_start": true
+    "update_adblock_on_start": true,
+    "extensions_popup_docked": true
 }

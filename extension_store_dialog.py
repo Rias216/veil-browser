@@ -44,6 +44,8 @@ from extension_store import (
     CRX_DETAIL_URL,
 )
 
+from debug_log import log as _dl_log
+
 CHROME_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -413,6 +415,7 @@ class ExtensionStoreDialog(QDialog):
         self._start_search_thread(query)
 
     def _on_search_ok(self, results: list):
+        _dl_log("search", "dialog._on_search_ok", count=len(results))
         self._set_searching(False)
         if not results:
             query = self.search_input.text().strip()
@@ -524,8 +527,11 @@ class ExtensionStoreDialog(QDialog):
     # ── Install / View on Web ────────────────────────────────────────
     def _on_install_clicked(self):
         if not self._current_info:
+            _dl_log("install", "_on_install_clicked:no-current-info")
             return
         ext_id = self._current_info.extension_id
+        _dl_log("install", "_on_install_clicked:enter",
+                ext_id=ext_id, name=self._current_info.name)
         self.install_btn.setEnabled(False)
         self.install_btn.setText("Installing\u2026")
         self.progress.setVisible(True)
@@ -544,6 +550,8 @@ class ExtensionStoreDialog(QDialog):
         self.status_label.setText(message)
 
     def _on_install_complete(self, extension_id: str, ok: bool, message: str):
+        _dl_log("install", "dialog._on_install_complete",
+                ext_id=extension_id, ok=ok, message=message)
         self.progress.setValue(100 if ok else self.progress.value())
         self.status_label.setText(message)
         if ok:
